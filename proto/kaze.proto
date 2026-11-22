@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package kaze.v1;
+
+option csharp_namespace = "Kaze.Protocol";
+option java_package = "app.kaze.proto";
+option java_multiple_files = true;
+
+
+message Envelope {
+  uint64 msg_id = 1;
+
+  oneof body {
+    Hello hello = 10;
+    Welcome welcome = 11;
+    Ack ack = 12;
+    Error error = 13;
+    GameDiscovered game = 20;
+    AttachRequest attach = 21;
+    AttachResult attach_result = 22;
+    TextBatch text_batch = 30;
+    TextPush text_push = 31;
+    Control control = 40;
+    InvokeRequest invoke_request = 41;
+    InvokeResult invoke_result = 42;
+    Ping ping = 50;
+    Pong pong = 51;
+  }
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_SHELL = 1;     
+  ROLE_ADAPTER = 2;   
+  ROLE_CLI = 3;       
+}
+
+message Hello {
+  uint32 proto = 1;   
+  Role role = 2;
+  uint32 pid = 3;
+  string token = 4;   
+  string nonce = 5;   
+  string name = 6;    
+}
+
+message Welcome {
+  uint32 proto = 1;
+  int64 server_time_ms = 2;
+  repeated string caps = 3;
+  string session = 4;  
+  string relay_version = 5;
+}
+
+message Ack {
+  uint64 ref_id = 1;
+  bool ok = 2;
+}
+
+message Error {
+  uint32 code = 1;
+  string message = 2;
+}
+
+message GameDiscovered {
+  string id = 1;
+  string title = 2;
+  string engine = 3;
+  string root = 4;
+}
+
+message AttachRequest {
+  string adapter = 1;   
+  string game_id = 2;
+}
+
+message AttachResult {
+  bool ok = 1;
+  string detail = 2;
+  string engine = 3;
+  int64 took_ms = 4;
+}
+
+message TextUnit {
+  string key = 1;
+  string source = 2;
+  string speaker = 3;
+  string scene = 4;
+  string context = 5;
+  string target = 6;    
+}
+
+message TextBatch {
+  string adapter = 1;
+  repeated TextUnit units = 2;
+}
+
+message TextPush {
+  string adapter = 1;
+  repeated TextUnit units = 2;
+}
+
+message Control {
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    START = 1;
+    STOP = 2;
+    RESTART = 3;
+  }
+  Action action = 1;
+  string target = 2;
+}
+
+
+message InvokeRequest {
+  string adapter = 1;    
+  string op = 2;         
+  string args_json = 3;  
+}
+
+message InvokeResult {
+  bool ok = 1;
+  string detail = 2;
+  string data_json = 3;  
+}
+
+message Ping {
+  int64 client_time_ms = 1;
+}
+
+message Pong {
+  int64 client_time_ms = 1;
+  int64 server_time_ms = 2;
+}
