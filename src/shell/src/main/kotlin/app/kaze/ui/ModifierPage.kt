@@ -40,8 +40,8 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.ArrowBack
-import androidx.compose.material.icons.outlined.ArrowForward
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.ArrowForward
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Tune
@@ -1195,9 +1195,9 @@ private fun CheatCards(rows: List<ModRow>, loading: Boolean, onRun: (ModRow) -> 
 @Composable
 private fun Pager(page: Int, total: Int, onPage: (Int) -> Unit) {
     Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
-        TextButton(onClick = { if (page > 0) onPage(page - 1) }, enabled = page > 0) { Icon(Icons.Outlined.ArrowBack, null, Modifier.size(15.dp)) }
+        TextButton(onClick = { if (page > 0) onPage(page - 1) }, enabled = page > 0) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, null, Modifier.size(15.dp)) }
         Text("${page + 1} / ${((total + 19) / 20).coerceAtLeast(1)}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        TextButton(onClick = { if ((page + 1) * 20 < total) onPage(page + 1) }, enabled = (page + 1) * 20 < total) { Icon(Icons.Outlined.ArrowForward, null, Modifier.size(15.dp)) }
+        TextButton(onClick = { if ((page + 1) * 20 < total) onPage(page + 1) }, enabled = (page + 1) * 20 < total) { Icon(Icons.AutoMirrored.Outlined.ArrowForward, null, Modifier.size(15.dp)) }
     }
 }
 

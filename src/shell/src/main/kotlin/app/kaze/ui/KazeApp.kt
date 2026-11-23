@@ -39,12 +39,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.CropSquare
-import androidx.compose.material.icons.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.ArrowDropDown
-import androidx.compose.material.icons.outlined.ArrowForward
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.FolderOpen
@@ -565,7 +564,7 @@ private fun GameDetailPage(game: Game, onBack: () -> Unit) {
     var launchStatus by remember(game.id) { mutableStateOf("") }
     Column(Modifier.fillMaxSize().verticalScroll(scroll).padding(horizontal = 34.dp, vertical = 18.dp)) {
         TextButton(onClick = onBack, contentPadding = PaddingValues(horizontal = 0.dp, vertical = 4.dp)) {
-            Icon(Icons.Outlined.ArrowBack, null, Modifier.size(18.dp))
+            Icon(Icons.AutoMirrored.Outlined.ArrowBack, null, Modifier.size(18.dp))
             Spacer(Modifier.width(6.dp))
             Text("资料库")
         }

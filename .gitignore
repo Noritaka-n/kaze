@@ -1,0 +1,59 @@
+# IDE and OS files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Gradle / Kotlin / Java
+.gradle/
+.kotlin/
+**/build/
+hs_err_pid*
+*.hprof
+
+# C++ generated sources and binaries
+src/relay-cpp/gen/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Logs and crash output
+*.log
+
+# Local runtime configuration, credentials, saves and diagnostics
+.env
+.env.*
+!.env.example
+**/settings.json
+**/relay.json
+**/library.json
+**/translation.db*
+**/data.kaze-backup/
+**/Data.kaze-backup/
+**/snapshots/
+**/diagnostics/
+*.bak
+*.key
+*.pem
+*.p12
+
+# Generated packaging resources and release output
+src/shell/src/main/resources/kaze-relay-runtime.zip
+/release/
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# Machine-local toolchains and scratch files
+/tools/gradle-*/
+/tools/msys64/
+/runtime/
+/tmp/

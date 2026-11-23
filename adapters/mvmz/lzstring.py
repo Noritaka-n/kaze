@@ -1,5 +1,8 @@
 """Minimal LZString codec (uint8array + base64 flavours) in pure Python.
 
+Algorithm reference: LZ-String by pieroxy, MIT license. This is an independent
+implementation; the reference JavaScript library is not included.
+
 RPG Maker MZ stores saves as LZString-compressed bytes; MV uses the base64
 flavour. Some games (MTool-patched) remove the global LZString from the JS
 context, so the adapter cannot borrow the engine's implementation.

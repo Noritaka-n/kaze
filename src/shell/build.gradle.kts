@@ -1,14 +1,14 @@
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 
 plugins {
-    kotlin("jvm") version "2.0.21"
-    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21"
-    id("org.jetbrains.compose") version "1.7.3"
+    kotlin("jvm") version "2.1.21"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.1.21"
+    id("org.jetbrains.compose") version "1.8.2"
     id("com.google.protobuf") version "0.9.4"
 }
 
 group = "app.kaze"
-version = "0.1.0"
+version = "1.0.1"
 
 kotlin { jvmToolchain(21) }
 
@@ -52,7 +52,7 @@ compose.desktop {
         nativeDistributions {
             targetFormats(TargetFormat.Msi)
             packageName = "Kaze"
-            packageVersion = "1.0.0"
+            packageVersion = "1.0.1"
             description = "Kaze - runtime text workbench for games"
             vendor = "Kaze"
             windows {

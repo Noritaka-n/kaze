@@ -21,7 +21,9 @@
 #include "kaze.pb.h"
 #include "kz_protocol.h"
 
+#ifdef _MSC_VER
 #pragma comment(lib, "bcrypt.lib")
+#endif
 
 namespace {
 
@@ -31,7 +33,7 @@ using kaze::PeekAvailable;
 using kaze::ReadFrame;
 using kaze::WriteFrame;
 
-constexpr const char* kVersion = "0.1.0";
+constexpr const char* kVersion = "1.0.1";
 
 
 
@@ -640,7 +642,10 @@ struct Client {
     bool Send(kaze::v1::Envelope& envelope, std::string& error) {
         envelope.set_msg_id(++seq);
         std::string bytes;
-        envelope.SerializeToString(&bytes);
+        if (!envelope.SerializeToString(&bytes)) {
+            error = "failed to serialize envelope";
+            return false;
+        }
 
         Frame frame;
         frame.type = TypeOf(envelope);

@@ -30,6 +30,10 @@ $env:PKG_CONFIG_PATH = Join-Path $msys "mingw64\lib\pkgconfig"
 $env:PATH = (Join-Path $msys "mingw64\bin") + ";" + $env:PATH
 
 if ($Clean) {
+    $relayTarget = Join-Path $build "kaze-relay.exe"
+    Get-CimInstance Win32_Process -Filter "Name='kaze-relay.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -eq $relayTarget } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }
     Remove-Item $gen, $build -Recurse -Force -ErrorAction SilentlyContinue
 }
 New-Item -ItemType Directory -Force $gen, $build | Out-Null

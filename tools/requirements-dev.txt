@@ -1,0 +1,2 @@
+# Optional: regenerate the checked-in RGSS test fixtures.
+rubymarshal==1.2.10
