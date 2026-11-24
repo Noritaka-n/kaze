@@ -18,7 +18,13 @@ class ModifierValuesTest {
         assertEquals("123", ModifierValues.encode("123", "number"))
         assertEquals("1.5", ModifierValues.encode("1.5", "number"))
         assertEquals("1000", ModifierValues.encode("1000", "money"))
-        assertEquals("0", ModifierValues.encode("not a number", "number"))
+    }
+
+    @Test
+    fun `invalid and non-finite numbers are rejected`() {
+        assertEquals(null, ModifierValues.encode("not a number", "number"))
+        assertEquals(null, ModifierValues.encode("NaN", "number"))
+        assertEquals(null, ModifierValues.encode("Infinity", "money"))
     }
 
     @Test

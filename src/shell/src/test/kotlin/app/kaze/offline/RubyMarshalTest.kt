@@ -34,6 +34,28 @@ class RubyMarshalTest {
     }
 
     @Test
+    fun `large negative integers use bignum and round trip without overflowing`() {
+        listOf(Long.MIN_VALUE, -(1L shl 56), -129L, -124L).forEach { value ->
+            val bytes = RubyMarshal.encode(RInt(value))
+            when (val decoded = RubyMarshal.decode(bytes)) {
+                is RInt -> assertEquals(value, decoded.value)
+                is RBignum -> {
+                    val littleEndian = ByteArray(decoded.words.size * 2)
+                    decoded.words.forEachIndexed { index, word ->
+                        littleEndian[index * 2] = word.toByte()
+                        littleEndian[index * 2 + 1] = (word shr 8).toByte()
+                    }
+                    val magnitude = java.math.BigInteger(1, littleEndian.reversedArray())
+                    val signed = if (decoded.negative) magnitude.negate() else magnitude
+                    assertEquals(value, signed.longValueExact())
+                }
+                else -> error("unexpected number type ${decoded::class.simpleName}")
+            }
+            assertContentEquals(bytes, RubyMarshal.encode(RubyMarshal.decode(bytes)))
+        }
+    }
+
+    @Test
     fun `string without encoding ivar round trips`() {
         val bytes = byteArrayOf(4, 8, 0x22, 10, 'h'.code.toByte(), 'e'.code.toByte(), 'l'.code.toByte(), 'l'.code.toByte(), 'o'.code.toByte())
         val value = RubyMarshal.decode(bytes)

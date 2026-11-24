@@ -562,6 +562,7 @@ private fun GameDetailPage(game: Game, onBack: () -> Unit) {
     val scroll = rememberScrollState()
     val scope = rememberCoroutineScope()
     var launchStatus by remember(game.id) { mutableStateOf("") }
+    var launching by remember(game.id) { mutableStateOf(false) }
     Column(Modifier.fillMaxSize().verticalScroll(scroll).padding(horizontal = 34.dp, vertical = 18.dp)) {
         TextButton(onClick = onBack, contentPadding = PaddingValues(horizontal = 0.dp, vertical = 4.dp)) {
             Icon(Icons.AutoMirrored.Outlined.ArrowBack, null, Modifier.size(18.dp))
@@ -599,21 +600,28 @@ private fun GameDetailPage(game: Game, onBack: () -> Unit) {
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Button(
                 onClick = {
+                    if (launching) return@Button
+                    launching = true
                     launchStatus = "正在启动…"
                     scope.launch {
-                        val result = withContext(Dispatchers.IO) { app.kaze.data.Runtime.launchGame(game) }
-                        launchStatus = result.fold(
-                            onSuccess = { "启动成功：$it" },
-                            onFailure = { "启动失败：${it.message ?: "未知错误"}" },
-                        )
+                        try {
+                            val result = withContext(Dispatchers.IO) { app.kaze.data.Runtime.launchGame(game) }
+                            launchStatus = result.fold(
+                                onSuccess = { "启动成功：$it" },
+                                onFailure = { "启动失败：${it.message ?: "未知错误"}" },
+                            )
+                        } finally {
+                            launching = false
+                        }
                     }
                 },
+                enabled = !launching,
                 shape = RoundedCornerShape(13.dp),
                 contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp),
             ) {
                 Icon(Icons.Outlined.PlayArrow, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(7.dp))
-                Text("启动游戏")
+                Text(if (launching) "正在启动…" else "启动游戏")
             }
         }
         if (launchStatus.isNotBlank()) {
@@ -668,6 +676,7 @@ private fun TranslatePage(window: ComposeWindow) {
     var result by remember { mutableStateOf<ScanResult?>(null) }
     var scanning by remember { mutableStateOf(false) }
     var translating by remember { mutableStateOf(false) }
+    var translationAttempted by remember { mutableStateOf(false) }
     var translations by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var status by remember { mutableStateOf("") }
     var progressDone by remember { mutableStateOf(0) }
@@ -683,6 +692,7 @@ private fun TranslatePage(window: ComposeWindow) {
         translations = emptyMap()
         scanning = false
         translating = false
+        translationAttempted = false
         retranslatingKey = ""
         showErrors = false
         progressDone = 0
@@ -699,6 +709,7 @@ private fun TranslatePage(window: ComposeWindow) {
         scanning = true
         status = "扫描游戏文本…"
         translations = emptyMap()
+        translationAttempted = false
         workJob = scope.launch {
             try {
                 val value = withContext(Dispatchers.IO) {
@@ -723,6 +734,7 @@ private fun TranslatePage(window: ComposeWindow) {
         if (translating || snapshot.entries.isEmpty()) return
         val targetId = targetGame.id
         translating = true
+        translationAttempted = true
         status = "准备翻译…"
         progressDone = 0
         progressTotal = 0
@@ -939,7 +951,7 @@ private fun TranslatePage(window: ComposeWindow) {
                     }
                     TextButton(
                         onClick = { showErrors = true },
-                        enabled = translations.isNotEmpty() && !translating,
+                        enabled = translationAttempted && result?.entries?.isNotEmpty() == true && !translating,
                     ) { Text("翻译错误") }
                     TextButton(
                         onClick = { exportTranslations() },
@@ -977,8 +989,7 @@ private fun TranslationErrorDialog(
 ) {
     var query by remember { mutableStateOf("") }
     val shown = entries.filter { entry ->
-        translations.containsKey(entry.text) &&
-            (query.isBlank() || entry.text.contains(query, true) || translations[entry.text]?.contains(query, true) == true)
+        query.isBlank() || entry.text.contains(query, true) || translations[entry.text]?.contains(query, true) == true
     }
     Dialog(onDismissRequest = onClose) {
         Surface(shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surface) {
@@ -1005,7 +1016,14 @@ private fun TranslationErrorDialog(
                             Column(Modifier.weight(1f)) {
                                 Text(entry.text, style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                 Spacer(Modifier.height(3.dp))
-                                Text(translations[entry.text].orEmpty(), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.primary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                val target = translations[entry.text]
+                                Text(
+                                    target?.takeIf { it.isNotBlank() } ?: "（未生成译文）",
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = if (target.isNullOrBlank()) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
                             }
                             Spacer(Modifier.width(12.dp))
                             TextButton(
@@ -1133,8 +1151,9 @@ private fun SettingsPage(dark: Boolean, onDarkChange: (Boolean) -> Unit) {
                     Switch(
                         checked = readOnly,
                         onCheckedChange = { next ->
-                            readOnly = next
-                            message = if (SettingsStore.save(SettingsStore.current.copy(readOnly = next))) {
+                            val saved = SettingsStore.save(SettingsStore.current.copy(readOnly = next))
+                            readOnly = SettingsStore.current.readOnly
+                            message = if (saved) {
                                 ""
                             } else {
                                 "设置保存失败：${SettingsStore.settingsPath()}"

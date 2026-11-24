@@ -250,7 +250,7 @@ class Adapter:
 
         try:
             import renpy.config as config                
-            import renpy.game as game                
+            import renpy.game as game
             prefs = game.preferences
             if cheat == "skip_unseen":
                 prefs.skip_unseen = True
@@ -478,6 +478,7 @@ def run_demo(adapter: Adapter) -> None:
 def install(pipe_name: str | None = None, token: str | None = None):
     """Hook Ren'Py. Returns the adapter so callers can shut it down."""
     import renpy.config as config                
+    import renpy.game as game
 
     if pipe_name is None or token is None:
         pipe_name, token = read_session()
@@ -495,7 +496,7 @@ def install(pipe_name: str | None = None, token: str | None = None):
         key = key_of(text)
         if key not in adapter.cache:
             try:
-                scene = str(renpy.game.context().current)
+                scene = str(game.context().current)
             except Exception:
                 scene = ""
             adapter.batcher.add("", text, scene)

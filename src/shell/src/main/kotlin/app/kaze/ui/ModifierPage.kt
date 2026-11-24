@@ -95,6 +95,8 @@ import kotlinx.coroutines.launch
 
 private enum class ModTab(val label: String) { Switches("开关"), Variables("变量"), Maps("地图"), Events("事件"), Items("物品"), Cheats("作弊") }
 
+private const val MOD_PAGE_SIZE = 20
+
 private data class ModRow(
     val key: String,
     val name: String,
@@ -187,18 +189,19 @@ fun ModifierPage() {
     fun refresh() {
         if (tab == ModTab.Items) return
         val requestedTab = tab
+        val requestedPage = page.coerceAtLeast(0)
         val serial = ++requestSerial
         loading = true
         message = ""
         val (op, args) = when (requestedTab) {
             ModTab.Switches -> if (query.isBlank())
-                "vars.page" to """{"kind":"switch","offset":0,"limit":300}"""
+                "vars.page" to """{"kind":"switch","offset":${requestedPage * MOD_PAGE_SIZE},"limit":$MOD_PAGE_SIZE}"""
             else
-                "vars.search" to """{"kind":"switch","q":${ModifierValues.quote(query)},"limit":200}"""
+                "vars.search" to """{"kind":"switch","q":${ModifierValues.quote(query)},"offset":${requestedPage * MOD_PAGE_SIZE},"limit":$MOD_PAGE_SIZE}"""
             ModTab.Variables -> if (query.isBlank())
-                "vars.page" to """{"kind":"var","offset":0,"limit":300}"""
+                "vars.page" to """{"kind":"var","offset":${requestedPage * MOD_PAGE_SIZE},"limit":$MOD_PAGE_SIZE}"""
             else
-                "vars.search" to """{"kind":"var","q":${ModifierValues.quote(query)},"limit":200}"""
+                "vars.search" to """{"kind":"var","q":${ModifierValues.quote(query)},"offset":${requestedPage * MOD_PAGE_SIZE},"limit":$MOD_PAGE_SIZE}"""
             ModTab.Maps -> "maps.list" to "{}"
             ModTab.Events -> "events.all" to "{}"
             ModTab.Items -> "party.items" to "{}"
@@ -226,6 +229,13 @@ fun ModifierPage() {
                 } else {
                     refreshRetries = 0
                     val parsed = parseRows(requestedTab, result.dataJson)
+                    if ((requestedTab == ModTab.Switches || requestedTab == ModTab.Variables) && requestedPage > 0) {
+                        val lastPage = if (parsed.second == 0) 0 else (parsed.second - 1) / MOD_PAGE_SIZE
+                        if (requestedPage > lastPage) {
+                            page = lastPage
+                            return@launch
+                        }
+                    }
                     rows = parsed.first
                     total = parsed.second
                     message = ""
@@ -267,12 +277,19 @@ fun ModifierPage() {
     LaunchedEffect(tab, selectedMap?.key, online) {
         if (tab != ModTab.Maps || !online) return@LaunchedEffect
         val id = selectedMap?.name?.toIntOrNull() ?: return@LaunchedEffect
-        targetTile = if (playerPos?.mapId == id) playerPos?.let { it.x to it.y } else null
+        mapPreview = null
+        mapGrid = null
+        targetTile = null
         mapLoading = true
         RelayState.invoke("map.preview", """{"map":$id}""") { r ->
             scope.launch {
                 if (selectedMap?.name?.toIntOrNull() != id) return@launch
-                if (r.ok) mapPreview = MapPreview.parse(r.dataJson)
+                val parsed = if (r.ok) MapPreview.parse(r.dataJson) else null
+                mapPreview = parsed
+                if (parsed == null) {
+                    mapGrid = null
+                    message = r.detail.ifBlank { "地图预览读取失败" }
+                }
                 mapLoading = false
             }
         }
@@ -282,10 +299,21 @@ fun ModifierPage() {
                 if (r.ok) {
                     val o = runCatching { JsonParser.parseString(r.dataJson).asJsonObject }.getOrNull()
                     if (o != null) mapGrid = MapGrid.decode(o.get("mapId")?.asInt ?: id, o.get("width")?.asInt ?: 0, o.get("height")?.asInt ?: 0, o.text("blocked"))
+                    else mapGrid = null
+                } else {
+                    mapGrid = null
+                    message = r.detail.ifBlank { "地图通行数据读取失败" }
                 }
             }
         }
-        RelayState.invoke("map.info", "{}") { r -> scope.launch { if (r.ok) playerPos = PlayerPos.parse(r.dataJson) } }
+        RelayState.invoke("map.info", "{}") { r ->
+            scope.launch {
+                if (!r.ok || selectedMap?.name?.toIntOrNull() != id) return@launch
+                val position = PlayerPos.parse(r.dataJson)
+                playerPos = position
+                targetTile = if (position?.mapId == id) position.x to position.y else null
+            }
+        }
     }
 
     fun loadParty() {
@@ -360,10 +388,17 @@ fun ModifierPage() {
     }
 
     fun toggle(row: ModRow) {
-        RelayState.invoke("vars.set", """{"name":${ModifierValues.quote(row.name)},"value":${if (row.value == "True") "false" else "true"}}""") { refresh() }
+        RelayState.invoke("vars.set", """{"name":${ModifierValues.quote(row.name)},"value":${if (row.value == "True") "false" else "true"}}""") {
+            scope.launch { refresh() }
+        }
     }
     fun saveVar(row: ModRow, value: String) {
-        RelayState.invoke("vars.set", """{"name":${ModifierValues.quote(row.name)},"value":${ModifierValues.encode(value, row.type)}}""") { r ->
+        val encoded = ModifierValues.encode(value, row.type)
+        if (encoded == null) {
+            message = "数值格式不正确，未发送修改"
+            return
+        }
+        RelayState.invoke("vars.set", """{"name":${ModifierValues.quote(row.name)},"value":$encoded}""") { r ->
             scope.launch { message = r.detail; refresh() }
         }
     }
@@ -415,7 +450,7 @@ fun ModifierPage() {
                     onThrough = {
                         val next = !throughOn
                         RelayState.invoke("cheats.run", """{"id":${ModifierValues.quote(if (next) "through_on" else "through_off")}}""") { r ->
-                            if (r.ok) throughOn = next
+                            if (r.ok) scope.launch { throughOn = next }
                         }
                     },
                     onTeleport = {
@@ -443,9 +478,13 @@ fun ModifierPage() {
                     throughOn = throughOn,
                     onGoldText = { goldText = it },
                     onApplyGold = {
-                        val value = goldText.toIntOrNull() ?: gold
-                        RelayState.invoke("party.setGold", """{"gold":$value}""") { r ->
-                            scope.launch { message = r.detail; loadParty() }
+                        val value = goldText.toIntOrNull()?.takeIf { it >= 0 }
+                        if (value == null) {
+                            message = "金币必须是非负整数，未发送修改"
+                        } else {
+                            RelayState.invoke("party.setGold", """{"gold":$value}""") { r ->
+                                scope.launch { message = r.detail; loadParty() }
+                            }
                         }
                     },
                     onAddGold = { goldText = ((goldText.toIntOrNull() ?: gold) + 9999).toString() },
@@ -486,6 +525,9 @@ fun ModifierPage() {
                     },
                 )
             }
+        }
+        if ((tab == ModTab.Switches || tab == ModTab.Variables) && total > MOD_PAGE_SIZE) {
+            Pager(page, total) { target -> page = target.coerceIn(0, (total - 1) / MOD_PAGE_SIZE) }
         }
         Spacer(Modifier.height(4.dp))
         Text(
@@ -559,7 +601,7 @@ internal fun FlatChip(
 }
 
 @Composable
-private fun RelayChip(online: Boolean, onRefresh: () -> Unit) {
+internal fun RelayChip(online: Boolean, onRefresh: () -> Unit) {
     Surface(
         shape = RoundedCornerShape(18.dp),
         color = if (online) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
@@ -1196,8 +1238,8 @@ private fun CheatCards(rows: List<ModRow>, loading: Boolean, onRun: (ModRow) -> 
 private fun Pager(page: Int, total: Int, onPage: (Int) -> Unit) {
     Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
         TextButton(onClick = { if (page > 0) onPage(page - 1) }, enabled = page > 0) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, null, Modifier.size(15.dp)) }
-        Text("${page + 1} / ${((total + 19) / 20).coerceAtLeast(1)}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        TextButton(onClick = { if ((page + 1) * 20 < total) onPage(page + 1) }, enabled = (page + 1) * 20 < total) { Icon(Icons.AutoMirrored.Outlined.ArrowForward, null, Modifier.size(15.dp)) }
+        Text("${page + 1} / ${((total + MOD_PAGE_SIZE - 1) / MOD_PAGE_SIZE).coerceAtLeast(1)}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        TextButton(onClick = { if ((page + 1) * MOD_PAGE_SIZE < total) onPage(page + 1) }, enabled = (page + 1) * MOD_PAGE_SIZE < total) { Icon(Icons.AutoMirrored.Outlined.ArrowForward, null, Modifier.size(15.dp)) }
     }
 }
 

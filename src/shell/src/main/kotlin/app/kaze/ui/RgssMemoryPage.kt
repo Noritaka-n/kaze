@@ -24,6 +24,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -35,8 +36,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import app.kaze.data.ModifierValues
 import app.kaze.ipc.RelayState
+import app.kaze.ipc.RelayStatus
 import com.google.gson.JsonParser
 import java.io.File
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @Composable
@@ -49,10 +52,21 @@ fun RgssMemoryPage(game: app.kaze.data.Game) {
     var rows by remember { mutableStateOf<List<MemRow>>(emptyList()) }
     var message by remember { mutableStateOf("先附加进程，再输入数值扫描。") }
     var loading by remember { mutableStateOf(false) }
+    var online by remember { mutableStateOf(false) }
+    var generation by remember { mutableStateOf(0) }
 
-    fun loadResults() {
+    LaunchedEffect(Unit) {
+        RelayState.connectAsync()
+        while (true) {
+            online = RelayState.status is RelayStatus.Online
+            delay(500)
+        }
+    }
+
+    fun loadResults(expectedGeneration: Int, expectedType: String) {
         RelayState.invoke("mem.results", "{}") { result ->
             scope.launch {
+                if (expectedGeneration != generation || expectedType != type) return@launch
                 loading = false
                 if (!result.ok) {
                     message = result.detail.ifBlank { "读取结果失败" }
@@ -74,9 +88,11 @@ fun RgssMemoryPage(game: app.kaze.data.Game) {
 
     fun attach() {
         loading = true
+        val requestGeneration = ++generation
         val name = File(game.launcher).name.ifBlank { "Game.exe" }
         RelayState.invoke("proc.attach", """{"exe":${ModifierValues.quote(name)}}""") { result ->
             scope.launch {
+                if (requestGeneration != generation) return@launch
                 loading = false
                 message = if (result.ok) "已附加进程：$name" else "附加失败：${result.detail}"
             }
@@ -89,20 +105,27 @@ fun RgssMemoryPage(game: app.kaze.data.Game) {
             message = "先输入要搜索的数值"
             return
         }
-        val numeric = if (type == "float") number.toDoubleOrNull()?.toString() else number.toLongOrNull()?.toString()
+        val scanType = type
+        val numeric = if (scanType == "float") {
+            number.toDoubleOrNull()?.takeIf { it.isFinite() }?.toString()
+        } else {
+            number.toIntOrNull()?.toString()
+        }
         if (numeric == null) {
-            message = "数值格式不正确"
+            message = if (scanType == "float") "请输入有限浮点数" else "请输入 32 位整数"
             return
         }
         loading = true
+        val requestGeneration = ++generation
         val op = if (filter) "mem.filter" else "mem.scan"
-        RelayState.invoke(op, """{"value":$numeric,"type":"$type"}""") { result ->
+        RelayState.invoke(op, """{"value":$numeric,"type":"$scanType"}""") { result ->
             scope.launch {
+                if (requestGeneration != generation || scanType != type) return@launch
                 if (!result.ok) {
                     loading = false
                     message = result.detail.ifBlank { "扫描失败" }
                 } else {
-                    loadResults()
+                    loadResults(requestGeneration, scanType)
                 }
             }
         }
@@ -114,17 +137,24 @@ fun RgssMemoryPage(game: app.kaze.data.Game) {
             return
         }
         val number = writeValue.trim()
-        val numeric = if (type == "float") number.toDoubleOrNull()?.toString() else number.toLongOrNull()?.toString()
+        val writeType = type
+        val numeric = if (writeType == "float") {
+            number.toDoubleOrNull()?.takeIf { it.isFinite() }?.toString()
+        } else {
+            number.toIntOrNull()?.toString()
+        }
         if (numeric == null) {
-            message = "写入值格式不正确"
+            message = if (writeType == "float") "请输入有限浮点数" else "请输入 32 位整数"
             return
         }
         loading = true
-        RelayState.invoke("mem.write", """{"address":$address,"type":"$type","value":$numeric}""") { result ->
+        val requestGeneration = ++generation
+        RelayState.invoke("mem.write", """{"address":$address,"type":"$writeType","value":$numeric}""") { result ->
             scope.launch {
+                if (requestGeneration != generation || writeType != type) return@launch
                 loading = false
                 message = if (result.ok) "已写入 ${rows.firstOrNull { it.address == address }?.hex ?: address.toString()}" else "写入失败：${result.detail}"
-                if (result.ok) loadResults()
+                if (result.ok) loadResults(requestGeneration, writeType)
             }
         }
     }
@@ -147,10 +177,25 @@ fun RgssMemoryPage(game: app.kaze.data.Game) {
             Column(Modifier.padding(18.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("类型", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    FlatChip("32 位整数", type == "int", height = 34) { type = "int"; rows = emptyList(); selectedAddress = null }
-                    FlatChip("浮点数", type == "float", height = 34) { type = "float"; rows = emptyList(); selectedAddress = null }
+                    FlatChip("32 位整数", type == "int", height = 34) {
+                        if (!loading && type != "int") {
+                            generation++
+                            type = "int"
+                            rows = emptyList()
+                            selectedAddress = null
+                        }
+                    }
+                    FlatChip("浮点数", type == "float", height = 34) {
+                        if (!loading && type != "float") {
+                            generation++
+                            type = "float"
+                            rows = emptyList()
+                            selectedAddress = null
+                        }
+                    }
                     Spacer(Modifier.weight(1f))
-                    TextButton(onClick = { attach() }, enabled = !loading) { Text("附加进程") }
+                    RelayChip(online) { RelayState.connectAsync() }
+                    TextButton(onClick = { attach() }, enabled = online && !loading) { Text("附加进程") }
                 }
                 Spacer(Modifier.height(12.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -162,10 +207,10 @@ fun RgssMemoryPage(game: app.kaze.data.Game) {
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier.weight(1f),
                     )
-                    Button(onClick = { scan(false) }, enabled = !loading, shape = RoundedCornerShape(12.dp)) {
+                    Button(onClick = { scan(false) }, enabled = online && !loading, shape = RoundedCornerShape(12.dp)) {
                         Text("首次扫描")
                     }
-                    Button(onClick = { scan(true) }, enabled = !loading && rows.isNotEmpty(), shape = RoundedCornerShape(12.dp)) {
+                    Button(onClick = { scan(true) }, enabled = online && !loading && rows.isNotEmpty(), shape = RoundedCornerShape(12.dp)) {
                         Text("再次筛选")
                     }
                 }
@@ -183,7 +228,7 @@ fun RgssMemoryPage(game: app.kaze.data.Game) {
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.weight(1f),
             )
-            Button(onClick = { write() }, enabled = !loading && selectedAddress != null, shape = RoundedCornerShape(12.dp)) {
+            Button(onClick = { write() }, enabled = online && !loading && selectedAddress != null, shape = RoundedCornerShape(12.dp)) {
                 Text("写入选中地址")
             }
         }

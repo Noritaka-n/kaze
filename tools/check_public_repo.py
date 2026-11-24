@@ -25,7 +25,11 @@ SKIP_DIRS = {
 }
 BINARY_SUFFIXES = {
     ".gguf", ".ggml", ".safetensors", ".onnx", ".pt", ".pth", ".bin",
-    ".exe", ".dll", ".so", ".dylib", ".zip", ".7z", ".tar", ".gz",
+    ".exe", ".dll", ".so", ".dylib", ".pyd", ".sys", ".ocx",
+    ".jar", ".class", ".war", ".ear", ".apk", ".ipa", ".msi", ".msm",
+    ".cab", ".pdb", ".lib", ".a", ".o", ".obj", ".dmg", ".pkg",
+    ".zip", ".7z", ".rar", ".tar", ".gz", ".xz", ".bz2", ".zst",
+    ".p12", ".pfx",
 }
 TEXT_SUFFIXES = {
     ".kt", ".kts", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".md",
@@ -41,6 +45,8 @@ SKIP_TEXT_SUFFIXES = {
 }
 SPECIAL_TEXT_NAMES = {".gitignore", ".gitattributes", ".env", "Dockerfile", "gradlew"}
 SENSITIVE_FILENAMES = {"settings.json", "relay.json", "library.json", ".env"}
+SENSITIVE_KEY_SUFFIXES = {".pem", ".key"}
+ALLOWED_BINARY_FILES = {"src/shell/gradle/wrapper/gradle-wrapper.jar"}
 MAX_BYTES = 5 * 1024 * 1024
 
 SECRET_PATTERNS = [
@@ -81,10 +87,21 @@ def candidate_files() -> list[Path]:
 
 
 def should_scan_text(path: Path) -> bool:
+    """Unknown extensions are text by default so new source/config formats are covered."""
     suffix = path.suffix.lower()
-    if suffix in SKIP_TEXT_SUFFIXES or suffix in BINARY_SUFFIXES:
-        return False
-    return not suffix or suffix in TEXT_SUFFIXES or path.name in SPECIAL_TEXT_NAMES
+    return suffix not in SKIP_TEXT_SUFFIXES and suffix not in BINARY_SUFFIXES
+
+
+def read_candidate_text(path: Path) -> str:
+    """Decode common Unicode BOMs instead of replacing every UTF-16 byte pattern."""
+    raw = path.read_bytes()
+    if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return raw.decode("utf-32", errors="replace")
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="replace")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig", errors="replace")
+    return raw.decode("utf-8", errors="replace")
 
 
 def main() -> int:
@@ -96,9 +113,12 @@ def main() -> int:
         suffix = path.suffix.lower()
         size = path.stat().st_size
 
-        if path.name in SENSITIVE_FILENAMES:
+        name = path.name.lower()
+        if name in SENSITIVE_FILENAMES or (name.startswith(".env.") and name != ".env.example"):
             findings.append(f"[runtime config] {relative}")
-        if suffix in BINARY_SUFFIXES:
+        if suffix in SENSITIVE_KEY_SUFFIXES:
+            findings.append(f"[private key file] {relative}")
+        if suffix in BINARY_SUFFIXES and relative.as_posix() not in ALLOWED_BINARY_FILES:
             findings.append(f"[binary] {relative} ({size} bytes)")
         if size > MAX_BYTES:
             findings.append(f"[large]  {relative} ({size / 1024 / 1024:.1f} MB)")
@@ -106,7 +126,7 @@ def main() -> int:
             continue
 
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text = read_candidate_text(path)
         except OSError as error:
             findings.append(f"[read]   {relative}: {error}")
             continue

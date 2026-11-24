@@ -126,6 +126,7 @@ def parse(buf: bytes) -> dict[int, list]:
     while index < size:
         key, index = _read_varint(buf, index)
         field, wire = key >> 3, key & 7
+        value: int | bytes
         if wire == WT_VARINT:
             value, index = _read_varint(buf, index)
         elif wire == WT_LEN:

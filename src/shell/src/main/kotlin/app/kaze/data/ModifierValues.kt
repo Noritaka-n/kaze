@@ -10,11 +10,11 @@ package app.kaze.data
 
 object ModifierValues {
 
-    fun encode(value: String, type: String?): String {
+    fun encode(value: String, type: String?): String? {
         val text = value.trim()
         return when (type?.lowercase()) {
             "bool", "boolean" -> if (isTruthy(text)) "true" else "false"
-            "number", "money" -> text.toDoubleOrNull()?.let(::format) ?: "0"
+            "number", "money" -> text.toDoubleOrNull()?.takeIf { it.isFinite() }?.let(::format)
             "string" -> quote(value)
             else -> {
                 

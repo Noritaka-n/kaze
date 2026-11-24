@@ -67,25 +67,39 @@ class KazeClient:
             time.sleep(0.02)
         raise RuntimeError(f"cannot open pipe {path}: {ctypes.get_last_error()}")
 
-                                                                         
-
     def _available(self) -> int:
         available = wintypes.DWORD(0)
         ok = kernel32.PeekNamedPipe(self._handle, None, 0, None,
                                     ctypes.byref(available), None)
-        return available.value if ok else 0
+        if not ok:
+            error = ctypes.get_last_error()
+            raise ConnectionError(f"pipe peek failed: {error}")
+        return available.value
 
-    def _read_exact(self, length: int) -> bytes:
+    def _read_exact(self, length: int, deadline: float | None = None) -> bytes:
         buffer = ctypes.create_string_buffer(length)
         offset = 0
         while offset < length:
+            remaining_time = None if deadline is None else deadline - time.monotonic()
+            if remaining_time is not None and remaining_time <= 0:
+                raise TimeoutError("timed out during frame read")
+            if deadline is None:
+                read_size = length - offset
+            else:
+                assert remaining_time is not None
+                ready = self._available()
+                if not ready:
+                    time.sleep(min(0.008, max(0.0, remaining_time)))
+                    continue
+                read_size = min(ready, length - offset)
             read = wintypes.DWORD(0)
             ok = kernel32.ReadFile(
                 self._handle, ctypes.byref(buffer, offset),
-                length - offset, ctypes.byref(read), None,
+                read_size, ctypes.byref(read), None,
             )
             if not ok or read.value == 0:
-                raise ConnectionError(f"read failed: {ctypes.get_last_error()}")
+                error = ctypes.get_last_error()
+                raise ConnectionError(f"pipe read failed: {error}")
             offset += read.value
         return buffer.raw[:length]
 
@@ -101,32 +115,42 @@ class KazeClient:
                 raise ConnectionError(f"write failed: {ctypes.get_last_error()}")
             offset += written.value
 
-                                                                         
-
     def send(self, body: int, payload: bytes, msg_id: int | None = None) -> int:
-        if msg_id is None:
-            self._seq += 1
-            msg_id = self._seq
-        else:
-                                                                         
-            self._seq = max(self._seq, msg_id)
-                                                                        
-        envelope = kz_wire.envelope(msg_id, body, payload)
-        frame = HEADER.pack(MAGIC, VERSION, kz_wire.FRAME_TYPE.get(body, 0), 0,
-                            len(envelope), msg_id) + envelope
+        # Sequence allocation, envelope construction and every WriteFile for a
+        # frame share one lock; batch flushes and pong/reply threads cannot mix.
         with self._write_lock:
+            if msg_id is None:
+                self._seq += 1
+                msg_id = self._seq
+            else:
+                self._seq = max(self._seq, msg_id)
+            envelope = kz_wire.envelope(msg_id, body, payload)
+            if len(envelope) > MAX_PAYLOAD:
+                raise ValueError("payload too large")
+            frame = HEADER.pack(MAGIC, VERSION, kz_wire.FRAME_TYPE.get(body, 0), 0,
+                                len(envelope), msg_id) + envelope
             self._write(frame)
         return msg_id
 
     def recv(self, timeout: float = 0.0):
-        """Returns (msg_id, body_name, payload) or None on timeout."""
+        """Return one frame, or None only when no header arrives before timeout.
+
+        Header and payload share one monotonic deadline. A partial-frame timeout
+        is fatal to this stream, rather than a false empty poll that would leave
+        the next receive starting in the middle of a payload.
+        """
         deadline = time.monotonic() + timeout if timeout else None
         while self._available() < HEADER.size:
-            if deadline is not None and time.monotonic() > deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 return None
-            time.sleep(0.008)
+            delay = 0.008 if deadline is None else min(
+                0.008, max(0.0, deadline - time.monotonic())
+            )
+            time.sleep(delay)
 
-        magic, version, _type, _flags, length, _msg_id = HEADER.unpack(self._read_exact(HEADER.size))
+        magic, version, _type, _flags, length, _msg_id = HEADER.unpack(
+            self._read_exact(HEADER.size, deadline)
+        )
         if magic != MAGIC:
             raise ValueError(f"bad magic 0x{magic:08X}")
         if version != VERSION:
@@ -134,27 +158,32 @@ class KazeClient:
         if length > MAX_PAYLOAD:
             raise ValueError("payload too large")
 
-        return kz_wire.split_envelope(self._read_exact(length))
+        return kz_wire.split_envelope(self._read_exact(length, deadline))
 
     def handshake(self) -> dict:
-        nonce = f"py-{int(time.time() * 1000)}"
-        self.send(
-            kz_wire.HELLO,
-            kz_wire.hello(1, self._role, os.getpid(), self._token, nonce, self._name),
-        )
+        try:
+            nonce = f"py-{int(time.time() * 1000)}"
+            self.send(
+                kz_wire.HELLO,
+                kz_wire.hello(1, self._role, os.getpid(), self._token, nonce, self._name),
+            )
 
-        reply = self.recv(timeout=5.0)
-        if reply is None:
-            raise TimeoutError("no welcome")
-        _msg_id, body, payload = reply
-        if body == "error":
-            error = kz_wire.parse_error(payload)
-            raise RuntimeError(f"relay rejected: {error['code']} {error['message']}")
-        if body != "welcome":
-            raise RuntimeError(f"unexpected handshake reply: {body}")
-        return kz_wire.parse_welcome(payload)
+            reply = self.recv(timeout=5.0)
+            if reply is None:
+                raise TimeoutError("no welcome")
+            _msg_id, body, payload = reply
+            if body == "error":
+                error = kz_wire.parse_error(payload)
+                raise RuntimeError(f"relay rejected: {error['code']} {error['message']}")
+            if body != "welcome":
+                raise RuntimeError(f"unexpected handshake reply: {body}")
+            return kz_wire.parse_welcome(payload)
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
-        if self._handle:
-            kernel32.CloseHandle(self._handle)
-            self._handle = None
+        handle = self._handle
+        self._handle = None
+        if handle:
+            kernel32.CloseHandle(handle)

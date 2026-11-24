@@ -32,6 +32,8 @@ object LibraryStore {
 
     private fun storeFile(): File = storeOverride ?: defaultStore
 
+    fun path(): String = storeFile().toString()
+
     var games: List<Game> = emptyList()
         private set
 

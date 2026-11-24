@@ -8,6 +8,8 @@ import com.sun.jna.ptr.IntByReference
 import java.io.Closeable
 import java.io.EOFException
 import java.io.IOException
+import java.net.SocketTimeoutException
+import java.util.concurrent.TimeUnit
 
 private const val GENERIC_READ = 0x80000000.toInt()
 private const val GENERIC_WRITE = 0x40000000
@@ -72,16 +74,26 @@ class NamedPipeTransport(path: String) : Closeable {
         h
     }
 
+    private val writeLock = Any()
+
+    @Volatile
+    private var closed = false
+
     fun write(bytes: ByteArray) {
-        var offset = 0
-        while (offset < bytes.size) {
-            val chunk = if (offset == 0) bytes else bytes.copyOfRange(offset, bytes.size)
-            val written = IntByReference()
-            if (!kernel.WriteFile(handle, chunk, chunk.size, written, null)) {
-                throw IOException("WriteFile failed (win32=${Native.getLastError()})")
+        // A frame can require several WriteFile calls. Keep the whole frame atomic
+        // with respect to the invoke/attach/push threads sharing this connection.
+        synchronized(writeLock) {
+            if (closed) throw IOException("pipe closed")
+            var offset = 0
+            while (offset < bytes.size) {
+                val chunk = if (offset == 0) bytes else bytes.copyOfRange(offset, bytes.size)
+                val written = IntByReference()
+                if (!kernel.WriteFile(handle, chunk, chunk.size, written, null)) {
+                    throw IOException("WriteFile failed (win32=${Native.getLastError()})")
+                }
+                if (written.value <= 0) throw IOException("WriteFile wrote 0 bytes")
+                offset += written.value
             }
-            if (written.value <= 0) throw IOException("WriteFile wrote 0 bytes")
-            offset += written.value
         }
     }
 
@@ -91,15 +103,39 @@ class NamedPipeTransport(path: String) : Closeable {
 
 
     fun available(): Int {
+        if (closed) throw IOException("pipe closed")
         val count = IntByReference(0)
-        return if (kernel.PeekNamedPipe(handle, null, 0, null, count, null)) count.value else 0
+        if (!kernel.PeekNamedPipe(handle, null, 0, null, count, null)) {
+            throw IOException("PeekNamedPipe failed (win32=${Native.getLastError()})")
+        }
+        return count.value
     }
 
-    fun readExact(length: Int): ByteArray {
+    fun readExact(length: Int, timeoutMillis: Long? = null): ByteArray {
+        if (closed) throw EOFException("pipe closed")
+        require(length >= 0) { "negative read length" }
+        require(timeoutMillis == null || timeoutMillis > 0) { "timeout must be positive" }
+        val deadline = timeoutMillis?.let {
+            System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(it)
+        }
         val result = ByteArray(length)
         var offset = 0
         while (offset < length) {
-            val chunk = ByteArray(length - offset)
+            if (closed) throw EOFException("pipe closed")
+            val count = if (deadline == null) {
+                length - offset
+            } else {
+                val remaining = deadline - System.nanoTime()
+                if (remaining <= 0) throw SocketTimeoutException("pipe read timed out after $timeoutMillis ms")
+                val ready = available()
+                if (ready == 0) {
+                    val sleepMillis = minOf(8L, TimeUnit.NANOSECONDS.toMillis(remaining).coerceAtLeast(1L))
+                    Thread.sleep(sleepMillis)
+                    continue
+                }
+                minOf(ready, length - offset)
+            }
+            val chunk = ByteArray(count)
             val read = IntByReference()
             if (!kernel.ReadFile(handle, chunk, chunk.size, read, null)) {
                 throw IOException("ReadFile failed (win32=${Native.getLastError()})")
@@ -112,10 +148,14 @@ class NamedPipeTransport(path: String) : Closeable {
     }
 
     override fun close() {
-        try {
-            kernel.CloseHandle(handle)
-        } catch (_: Throwable) {
-            
+        synchronized(writeLock) {
+            if (closed) return
+            closed = true
+            try {
+                kernel.CloseHandle(handle)
+            } catch (_: Throwable) {
+                // Closing is idempotent; later reads and writes fail via `closed`.
+            }
         }
     }
 }

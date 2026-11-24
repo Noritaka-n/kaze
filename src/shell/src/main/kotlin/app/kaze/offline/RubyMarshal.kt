@@ -141,7 +141,7 @@ object RubyMarshal {
             for (index in 0 until size) {
                 value = value or ((readByte().toLong()) shl (8 * index))
             }
-            if (first < 0) {
+            if (first < 0 && size < 8) {
                 value -= 1L shl (8 * size)
             }
             return value
@@ -350,6 +350,26 @@ object RubyMarshal {
             }
         }
 
+        private fun writeBignum(value: Long) {
+            val signedBytes = java.math.BigInteger.valueOf(value).abs().toByteArray()
+            val magnitude = if (signedBytes.size > 1 && signedBytes[0] == 0.toByte()) {
+                signedBytes.copyOfRange(1, signedBytes.size)
+            } else {
+                signedBytes
+            }
+            val words = (magnitude.size + 1) / 2
+            writeByte('l'.code)
+            writeByte(if (value < 0) '-'.code else '+'.code)
+            writeLong(words.toLong())
+            repeat(words) { word ->
+                val lowIndex = magnitude.size - 1 - word * 2
+                val low = magnitude[lowIndex].toInt() and 0xFF
+                val high = if (lowIndex > 0) magnitude[lowIndex - 1].toInt() and 0xFF else 0
+                writeByte(low)
+                writeByte(high)
+            }
+        }
+
         private fun writeSymbol(symbol: RSymbol) {
             val known = symbols[symbol.name]
             if (known != null) {
@@ -420,8 +440,14 @@ object RubyMarshal {
                 is RFalse -> writeByte('F'.code)
 
                 is RInt -> {
-                    writeByte('i'.code)
-                    writeLong(value.value)
+                    if (value.value in -1_073_741_824L..1_073_741_823L) {
+                        writeByte('i'.code)
+                        writeLong(value.value)
+                    } else {
+                        if (!begin(value)) return
+                        writeBignum(value.value)
+                        finish(value)
+                    }
                 }
 
                 is RSymbol -> {

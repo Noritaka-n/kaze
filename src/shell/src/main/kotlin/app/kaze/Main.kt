@@ -19,6 +19,9 @@ import app.kaze.ui.theme.KazeTheme
 private var lockChannel: java.nio.channels.FileChannel? = null
 private var lock: java.nio.channels.FileLock? = null
 
+internal fun selectLaunchGame(games: List<app.kaze.data.Game>, id: String?): app.kaze.data.Game? =
+    if (id == null) games.firstOrNull() else games.firstOrNull { it.id == id }
+
 private fun runCli(args: Array<String>): Boolean {
     val command = args.firstOrNull() ?: return false
     if (command == "--key") {
@@ -56,7 +59,12 @@ private fun runCli(args: Array<String>): Boolean {
     if (command == "--relay-file") {
         val op = args.getOrNull(1) ?: run { println("usage: --relay-file <op> <jsonFile>"); return true }
         val file = args.getOrNull(2) ?: run { println("usage: --relay-file <op> <jsonFile>"); return true }
-        val payload = runCatching { java.io.File(file).readText(Charsets.UTF_8) }.getOrDefault("{}")
+        val payload = try {
+            java.io.File(file).readText(Charsets.UTF_8)
+        } catch (error: Exception) {
+            println("error reading $file: ${error.message}")
+            return true
+        }
         val result = kotlinx.coroutines.runBlocking {
             app.kaze.ipc.RelayState.connectAsync()
             kotlinx.coroutines.withTimeout(20_000) {
@@ -83,7 +91,12 @@ private fun runCli(args: Array<String>): Boolean {
     if (command == "--translate-ui") {
         val gameId = args.getOrNull(1).orEmpty()
         val file = args.getOrNull(2) ?: run { println("usage: --translate-ui <gameId> <labelsFile>"); return true }
-        val labels = runCatching { java.io.File(file).readLines(Charsets.UTF_8) }.getOrDefault(emptyList())
+        val labels = try {
+            java.io.File(file).readLines(Charsets.UTF_8)
+        } catch (error: Exception) {
+            println("error reading $file: ${error.message}")
+            return true
+        }
         val result = kotlinx.coroutines.runBlocking {
             app.kaze.translate.UiTranslation.translate(labels, gameId)
         }
@@ -166,10 +179,9 @@ private fun runCli(args: Array<String>): Boolean {
     if (command == "--launch") {
         app.kaze.data.LibraryStore.load()
         val id = args.getOrNull(1)
-        val game = id?.let { wanted -> app.kaze.data.LibraryStore.games.firstOrNull { it.id == wanted } }
-            ?: app.kaze.data.LibraryStore.games.firstOrNull()
+        val game = selectLaunchGame(app.kaze.data.LibraryStore.games, id)
         if (game == null) {
-            println("no games in library")
+            println(if (id == null) "no games in library" else "game not found: $id")
             return true
         }
         val result = app.kaze.data.Runtime.launchGame(game) { println("[launch] $it") }
@@ -205,7 +217,8 @@ fun main(args: Array<String>) {
     }
     if (runCli(args)) return
 
-    runCatching {
+    var lockConflict = false
+    try {
         val base = System.getenv("LOCALAPPDATA") ?: System.getProperty("user.home")
         val lockFile = java.io.File(base, "Kaze/kaze.lock")
         lockFile.parentFile?.mkdirs()
@@ -215,8 +228,21 @@ fun main(args: Array<String>) {
             java.nio.file.StandardOpenOption.WRITE,
         )
         lock = lockChannel?.tryLock()
+        lockConflict = lock == null
+    } catch (_: java.nio.channels.OverlappingFileLockException) {
+        lockConflict = true
+    } catch (error: Exception) {
+        // Lock infrastructure failures are different from another running instance.
+        // Keep startup available, but make the degraded state visible.
+        println("warning: single-instance lock unavailable: ${error.message}")
+        runCatching { lock?.release() }
+        runCatching { lockChannel?.close() }
+        lock = null
+        lockChannel = null
     }
-    if (lock == null) {
+    if (lockConflict) {
+        runCatching { lockChannel?.close() }
+        lockChannel = null
         app.kaze.ui.WindowCorners.focusExisting("Kaze")
         return
     }

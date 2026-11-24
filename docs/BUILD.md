@@ -67,6 +67,7 @@ python tools\make_rgss_fixtures.py
 ## 发布前检查与打包
 
 ```powershell
+python -m unittest tools\test_check_public_repo.py -v
 python tools\check_public_repo.py
 $env:JAVA_HOME = "C:\Program Files\Zulu\zulu-21"
 $env:KAZE_MSYS = "C:\msys64"
@@ -81,6 +82,10 @@ release/Kaze-<版本>-win-x64.zip
 release/Kaze-<版本>-win-x64.zip.sha256
 ```
 
-版本号取自 `src/shell/build.gradle.kts` 的 `packageVersion`。发布新版本时，同时更新该文件的 `version`、`packageVersion` 和 relay 的 `kVersion`。
+版本号取自 `src/shell/build.gradle.kts` 的 `packageVersion`。发布新版本时，同时更新该文件的 `version`、`packageVersion` 和 relay 的 `kVersion`；打包脚本会在构建前拒绝三者不一致，并在归档后核验应用元数据和主 JAR 版本。
+
+标准发布需要 Python 3.11+ 与 `tools/requirements-dev.txt` 中固定版本的 PyInstaller。脚本会清理并重建 `kaze-mvmz-adapter.exe`、`kaze-memory-adapter.exe`，逐个执行 `--help` 冒烟测试，再将它们放入 `runtime-bin/`；发行归档缺少其中任一项都会失败。
+
+若明确需要生成依赖用户机器 Python 的包，可追加 `-AllowPythonPrerelease`。此模式会发出警告并在包内写入 `RUNTIME-REQUIREMENTS.txt`，要求 64 位 Python 3.11+ 可通过 `PATH` 或 `KAZE_PYTHON` 使用；缺少 PyInstaller 且未显式指定该开关时，打包会在构建前失败，不再静默产生缺少运行时的发行包。
 
 `release/`、生成的 `kaze-relay-runtime.zip`、构建产物、日志和本地设置均由 `.gitignore` 排除。

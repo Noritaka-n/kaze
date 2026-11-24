@@ -18,33 +18,47 @@ object ControlCodes {
             """|%%""",
     )
 
-    data class Protected(val text: String, val tokens: List<String>)
+    private val numericMarker = Regex("""\{\{\s*(\d+)\s*}}""")
+
+    data class Protected(
+        val text: String,
+        val tokens: List<String>,
+        val startIndex: Int = 0,
+    )
 
     fun protect(source: String): Protected {
         if (source.isEmpty()) return Protected(source, emptyList())
+        val tokenCount = pattern.findAll(source).count()
+        val occupied = numericMarker.findAll(source)
+            .mapNotNull { it.groupValues[1].toIntOrNull() }
+            .toHashSet()
+        var startIndex = 0
+        while ((startIndex until startIndex + tokenCount).any(occupied::contains)) startIndex++
+
         val tokens = mutableListOf<String>()
+        var nextIndex = startIndex
         val text = pattern.replace(source) { match ->
             tokens += match.value
-            "{{${tokens.size - 1}}}"
+            "{{${nextIndex++}}}"
         }
-        return Protected(text, tokens)
+        return Protected(text, tokens, startIndex)
     }
 
     
-    fun restore(translated: String, tokens: List<String>): String? {
+    fun restore(translated: String, tokens: List<String>, startIndex: Int = 0): String? {
         if (tokens.isEmpty()) return translated
         var result = translated
-        var missing = false
+        var invalid = false
         tokens.forEachIndexed { index, token ->
-            val marker = Regex("""\{\{\s*$index\s*}}""")
-            if (!marker.containsMatchIn(result)) {
-                missing = true
+            val markerIndex = startIndex + index
+            val marker = Regex("""\{\{\s*$markerIndex\s*}}""")
+            if (marker.findAll(result).count() != 1) {
+                invalid = true
             } else {
                 result = marker.replace(result) { token }
             }
         }
-        if (missing) return null
-        
-        return result.replace(Regex("""\{\{\s*\d+\s*}}"""), "")
+        if (invalid) return null
+        return result
     }
 }

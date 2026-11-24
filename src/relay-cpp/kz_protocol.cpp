@@ -1,15 +1,39 @@
 #include "kz_protocol.h"
 
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 namespace kaze {
 namespace {
 
-bool ReadExact(HANDLE pipe, char* buffer, DWORD length, std::string& error) {
+using SteadyClock = std::chrono::steady_clock;
+
+bool ReadExact(HANDLE pipe, char* buffer, DWORD length,
+               SteadyClock::time_point deadline, std::string& error) {
     DWORD offset = 0;
     while (offset < length) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
+            error = "PeekNamedPipe failed: " + std::to_string(GetLastError());
+            return false;
+        }
+        if (available == 0) {
+            const auto now = SteadyClock::now();
+            if (now >= deadline) {
+                error = "read timeout";
+                return false;
+            }
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                remaining < std::chrono::milliseconds(5) ? remaining.count() : 5));
+            continue;
+        }
+
+        DWORD chunk = length - offset;
+        if (available < chunk) chunk = available;
         DWORD read = 0;
-        if (!ReadFile(pipe, buffer + offset, length - offset, &read, nullptr)) {
+        if (!ReadFile(pipe, buffer + offset, chunk, &read, nullptr)) {
             error = "ReadFile failed: " + std::to_string(GetLastError());
             return false;
         }
@@ -70,9 +94,11 @@ uint64_t GetU64(const char* p) {
 
 }  
 
-bool ReadFrame(HANDLE pipe, Frame& out, std::string& error) {
+bool ReadFrame(HANDLE pipe, Frame& out, std::string& error, int timeout_ms) {
+    error.clear();
+    const auto deadline = SteadyClock::now() + std::chrono::milliseconds(timeout_ms);
     char header[kHeaderSize];
-    if (!ReadExact(pipe, header, kHeaderSize, error)) return false;
+    if (!ReadExact(pipe, header, kHeaderSize, deadline, error)) return false;
 
     const uint32_t magic = GetU32(header);
     if (magic != kMagic) {
@@ -96,7 +122,7 @@ bool ReadFrame(HANDLE pipe, Frame& out, std::string& error) {
     }
 
     out.payload.assign(length, '\0');
-    if (length > 0 && !ReadExact(pipe, out.payload.data(), length, error)) return false;
+    if (length > 0 && !ReadExact(pipe, out.payload.data(), length, deadline, error)) return false;
     return true;
 }
 
@@ -122,10 +148,14 @@ bool WriteFrame(HANDLE pipe, const Frame& frame, std::string& error) {
     return true;
 }
 
-int PeekAvailable(HANDLE pipe) {
-    DWORD available = 0;
-    if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) return 0;
-    return static_cast<int>(available);
+bool PeekAvailable(HANDLE pipe, DWORD& available, std::string& error) {
+    available = 0;
+    error.clear();
+    if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
+        error = "PeekNamedPipe failed: " + std::to_string(GetLastError());
+        return false;
+    }
+    return true;
 }
 
 }  

@@ -41,4 +41,21 @@ class ControlCodesTest {
         assertTrue(protected.tokens.isEmpty())
         assertEquals("普通的句子", ControlCodes.restore("普通的句子", protected.tokens))
     }
+
+    @Test
+    fun `generated markers do not collide with literal numeric markers`() {
+        val protected = ControlCodes.protect("literal {{0}} and {{1}}: \\N[1] \\C[2]")
+        assertEquals(2, protected.startIndex)
+        assertEquals("literal {{0}} and {{1}}: {{2}} {{3}}", protected.text)
+        assertEquals(
+            "literal {{0}} and {{1}}: \\N[1] \\C[2]",
+            ControlCodes.restore(protected.text, protected.tokens, protected.startIndex),
+        )
+    }
+
+    @Test
+    fun `unrelated literal markers are not deleted during restore`() {
+        val protected = ControlCodes.protect("keep {{99}} \\N[1]")
+        assertEquals("keep {{99}} \\N[1]你好", ControlCodes.restore("keep {{99}} {{0}}你好", protected.tokens))
+    }
 }

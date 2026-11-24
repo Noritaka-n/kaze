@@ -70,12 +70,12 @@ class PluginBridge:
 
     def __init__(self, port: int = 9223) -> None:
         self.port = port
-        self.conn = None
+        self.conn: socket.socket | None = None
         self._lock = threading.Lock()
         self._seq = 0
         self._pending: dict[int, dict] = {}
         self.engine = ""
-        self._server = None
+        self._server: socket.socket | None = None
 
     @property
     def connected(self) -> bool:
@@ -158,9 +158,10 @@ class PluginBridge:
             conn.settimeout(None)
         except Exception:
             pass
-        previous = self.conn
-        self.conn = conn
-        self.engine = hello.get("engine", "")
+        with self._lock:
+            previous = self.conn
+            self.conn = conn
+            self.engine = hello.get("engine", "")
         if previous is not None and previous is not conn:
                                                                             
                                                                     
@@ -200,12 +201,14 @@ class PluginBridge:
                 if message.get("hello") == "kaze":
                     self.engine = message.get("engine", "")
                     continue
-                slot = self._pending.pop(message.get("id"), None)
+                with self._lock:
+                    slot = self._pending.pop(message.get("id"), None)
                 if slot is not None:
                     slot["value"] = message.get("value")
                     slot["event"].set()
-        if self.conn is conn:
-            self.conn = None
+        with self._lock:
+            if self.conn is conn:
+                self.conn = None
         try:
             conn.close()
         except Exception:
@@ -222,15 +225,24 @@ class PluginBridge:
         if self.conn is None:
             raise ConnectionError("plugin not connected")
         with self._lock:
+            conn = self.conn
+            if conn is None:
+                raise ConnectionError("plugin disconnected")
             self._seq += 1
             request_id = self._seq
-            slot = {"event": threading.Event(), "value": None}
+            slot: dict[str, object] = {"event": threading.Event(), "value": None}
             self._pending[request_id] = slot
-            self.conn.sendall(
-                (json.dumps({"id": request_id, "expr": expression}) + "\n").encode("utf-8")
-            )
-        if not slot["event"].wait(timeout):
-            self._pending.pop(request_id, None)
+            try:
+                conn.sendall(
+                    (json.dumps({"id": request_id, "expr": expression}) + "\n").encode("utf-8")
+                )
+            except Exception:
+                self._pending.pop(request_id, None)
+                raise
+        event = slot["event"]
+        if not isinstance(event, threading.Event) or not event.wait(timeout):
+            with self._lock:
+                self._pending.pop(request_id, None)
             raise TimeoutError("plugin did not answer")
         return slot["value"]
 class MvmzAdapter:
@@ -240,7 +252,7 @@ class MvmzAdapter:
         self.attached = False
         self.last_error = ""
         self.text_enabled = False
-        self.pending_text = {}
+        self.pending_text: dict[str, int] = {}
         self._last_poll = 0.0
         self._cdp_retry_after = 0.0
         self.bridge = PluginBridge()
@@ -493,44 +505,57 @@ class MvmzAdapter:
     def _vars_search(self, args: dict) -> dict:
         query = str(args.get("q", ""))
         kind = str(args.get("kind", "var"))
+        offset = max(0, int(args.get("offset", 0)))
         limit = max(1, min(200, int(args.get("limit", 60))))
 
         if kind == "switch":
             expression = (
                 "(() => {"
                 "  const q = " + json.dumps(query.lower()) + ";"
-                "  const total = (typeof $dataSystem !== 'undefined' && $dataSystem.switches)"
+                "  const engineTotal = (typeof $dataSystem !== 'undefined' && $dataSystem.switches)"
                 "    ? $dataSystem.switches.length - 1 : 0;"
                 "  const out = [];"
-                "  for (let i = 1; i <= total && out.length < " + str(limit) + "; i++) {"
+                "  let total = 0;"
+                f"  const offset = {offset};"
+                f"  const limit = {limit};"
+                "  for (let i = 1; i <= engineTotal; i++) {"
                 "    const on = $gameSwitches.value(i);"
                 "    const label = ($dataSystem.switches[i] || '');"
                 "    const text = ('s[' + i + '] ' + label + ' ' + (on ? 'true' : 'false')).toLowerCase();"
                 "    if (!q || text.indexOf(q) >= 0) {"
-                "      out.push({name: 's[' + i + ']', type: 'bool', label: label,"
-                "                value: on ? 'True' : 'False'});"
+                "      if (total >= offset && out.length < limit) {"
+                "        out.push({name: 's[' + i + ']', type: 'bool', label: label,"
+                "                  value: on ? 'True' : 'False'});"
+                "      }"
+                "      total++;"
                 "    }"
                 "  }"
-                "  return JSON.stringify({total: total, items: out});"
+                "  return JSON.stringify({total: total, offset: offset, items: out});"
                 "})()"
             )
         else:
             expression = (
                 "(() => {"
                 "  const q = " + json.dumps(query.lower()) + ";"
-                "  const total = (typeof $dataSystem !== 'undefined' && $dataSystem.variables)"
+                "  const engineTotal = (typeof $dataSystem !== 'undefined' && $dataSystem.variables)"
                 "    ? $dataSystem.variables.length - 1 : 0;"
                 "  const out = [];"
-                "  for (let i = 1; i <= total && out.length < " + str(limit) + "; i++) {"
+                "  let total = 0;"
+                f"  const offset = {offset};"
+                f"  const limit = {limit};"
+                "  for (let i = 1; i <= engineTotal; i++) {"
                 "    const v = $gameVariables.value(i);"
                 "    const label = ($dataSystem.variables[i] || '');"
                 "    const text = ('v[' + i + '] ' + label + ' ' + JSON.stringify(v)).toLowerCase();"
                 "    if (!q || text.indexOf(q) >= 0) {"
-                "      out.push({name: 'v[' + i + ']', type: typeof v, label: label,"
-                "                value: JSON.stringify(v === undefined ? 0 : v)});"
+                "      if (total >= offset && out.length < limit) {"
+                "        out.push({name: 'v[' + i + ']', type: typeof v, label: label,"
+                "                  value: JSON.stringify(v === undefined ? 0 : v)});"
+                "      }"
+                "      total++;"
                 "    }"
                 "  }"
-                "  return JSON.stringify({total: total, items: out});"
+                "  return JSON.stringify({total: total, offset: offset, items: out});"
                 "})()"
             )
 
@@ -1184,7 +1209,7 @@ class MvmzAdapter:
             "    .filter(Boolean).forEach(m => { names[m.id] = m.name || ('地图 ' + m.id); });"
             "  const out = [];"
             "  for (const file of fs.readdirSync(dir)) {"
-            "    const hit = /^Map(\d{3})\.json$/.exec(file);"
+            "    const hit = /^Map(\\d{3})\\.json$/.exec(file);"
             "    if (!hit) continue;"
             "    const mapId = parseInt(hit[1], 10);"
             "    let map;"
@@ -1533,63 +1558,75 @@ class MvmzAdapter:
         text = raw.decode("utf-8", "surrogateescape")
         return bytes(ord(character) & 0xFF for character in text)
 
-    def _decode_save(self, path: str):
-        raw = open(path, "rb").read()
+    def _decode_save_format(self, path: str):
+        """Return (value, encoding), proving each candidate by decoding JSON."""
+        with open(path, "rb") as handle:
+            raw = handle.read()
 
-                                                                      
         try:
             blob = self._save_blob(raw)
             if blob[:1] == b"\x78":
-                return json.loads(zlib.decompress(blob).decode("utf-8"))
+                data = json.loads(zlib.decompress(blob).decode("utf-8"))
+                return data, "zlib-text"
         except Exception:
             pass
 
-                            
+        try:
+            if raw[:1] == b"\x78":
+                data = json.loads(zlib.decompress(raw).decode("utf-8"))
+                return data, "zlib-raw"
+        except Exception:
+            pass
+
         try:
             text = raw.decode("utf-8").lstrip()
             if text.startswith("{"):
-                return json.loads(text)
+                return json.loads(text), "json"
         except Exception:
             pass
 
-                                          
+        # A base64 payload's first character is data-dependent (normal JSON
+        # saves commonly start with 'N'), so never infer its format from A-H.
+        try:
+            encoded = raw.decode("ascii").strip()
+            text = lzstring.decompress_base64(encoded)
+            if text:
+                return json.loads(text), "lz-base64"
+        except Exception:
+            pass
+
         try:
             text = lzstring.decompress_uint8array(raw)
             if text:
-                return json.loads(text)
+                return json.loads(text), "lz-uint8"
         except Exception:
             pass
 
-                                               
-        try:
-            text = lzstring.decompress_base64(raw.decode("utf-8").strip())
-            if text:
-                return json.loads(text)
-        except Exception:
-            pass
+        return None, None
 
-        return None
+    def _decode_save(self, path: str):
+        data, _encoding = self._decode_save_format(path)
+        return data
 
     def _encode_save(self, path: str, data: dict) -> bool:
-        """Writes the save back in the same encoding it was read with."""
-        raw = open(path, "rb").read()
+        """Write the exact encoding established by a successful decode."""
+        _old_data, encoding = self._decode_save_format(path)
+        if encoding is None:
+            raise ValueError("无法识别存档格式")
         text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
-        try:
-            blob = self._save_blob(raw)
-            zlib_mode = blob[:1] == b"\x78"
-        except Exception:
-            zlib_mode = False
-
-        if zlib_mode:
+        if encoding in ("zlib-text", "zlib-raw"):
             packed = zlib.compress(text.encode("utf-8"), 1)
-            payload = "".join(chr(byte) for byte in packed).encode("utf-8")
-        elif raw.lstrip()[:1] == b"{":
+            payload = ("".join(chr(byte) for byte in packed).encode("utf-8")
+                       if encoding == "zlib-text" else packed)
+        elif encoding == "json":
             payload = text.encode("utf-8")
-        elif raw.strip()[:1] in (b"A", b"B", b"C", b"D", b"E", b"F", b"G", b"H"):
-            payload = lzstring.compress_to_base64(text).encode("utf-8")
-        else:
+        elif encoding == "lz-base64":
+            payload = lzstring.compress_to_base64(text).encode("ascii")
+        elif encoding == "lz-uint8":
             payload = lzstring.compress_to_uint8array(text)
+        else:
+            raise ValueError(f"未知存档编码: {encoding}")
 
         backup = path + ".kaze-backup"
         if not os.path.exists(backup):
@@ -1687,7 +1724,7 @@ class MvmzAdapter:
                 "size": os.path.getsize(full),
                 "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(full))),
             })
-        items.sort(key=lambda item: item["mtime"], reverse=True)
+        items.sort(key=lambda item: str(item["mtime"]), reverse=True)
         return {"ok": True, "detail": f"{len(items)} 个备份",
                 "data_json": json.dumps(items, ensure_ascii=False)}
 
@@ -1745,7 +1782,7 @@ class MvmzAdapter:
                                                                          
 
     def run(self) -> None:
-        print(f"[mvmz] waiting for relay messages", flush=True)
+        print("[mvmz] waiting for relay messages", flush=True)
         while True:
             self._maybe_poll()
             message = self.client.recv(timeout=0.25)

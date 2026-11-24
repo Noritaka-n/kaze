@@ -23,7 +23,7 @@ Kaze 的目标是仓库本身可以直接公开，不依赖任何“不能上传
 python tools/check_public_repo.py
 ```
 
-脚本检查 Git 已跟踪文件及未被忽略的可发布文件，包括无扩展名文件、`.gitignore`、`.env` 和常见源码/配置格式：
+脚本检查 Git 已跟踪文件及未被忽略的可发布文件。除明确的图片、字体、音视频等格式外，未知后缀也默认按文本检查；支持 UTF-8 以及带 BOM 的 UTF-16/UTF-32。`.env.example` 会检查真实密钥但不会仅因文件名被拦截，其他 `.env.*`、私钥文件和常见二进制包会被拦截；唯一例外是构建必需的 `src/shell/gradle/wrapper/gradle-wrapper.jar`：
 
 1. 模型/运行时/原生库后缀及运行时配置；
 2. 大于 5 MB 的文件；

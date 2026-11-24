@@ -10,13 +10,16 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "adapters", "mvmz"))
 sys.path.insert(0, os.path.join(ROOT, "adapters", "renpy"))
+sys.path.insert(0, os.path.join(ROOT, "adapters", "memory"))
 
 import mvmz_adapter
+import memory_adapter
 import renpy_adapter
 
 FAILED: list[str] = []
@@ -192,6 +195,49 @@ def test_var_labels() -> None:
     check("variable page carries names", items and items[0].get("label") == "变量一", str(items)[:100])
 
 
+def test_var_pagination() -> None:
+    prefix = (
+        "globalThis.$dataSystem = {"
+        "  switches: ['', 'even', 'odd', 'even'],"
+        "  variables: ['', 'alpha', 'beta', 'alphabet', 'alpha']};"
+        "globalThis.$gameVariables = {value: (i) => i * 10};"
+        "globalThis.$gameSwitches = {value: (i) => i % 2 === 0};"
+    )
+    adapter = fake_mv()
+    for offset, expected_names in ((0, ["v[1]", "v[2]"]), (2, ["v[3]", "v[4]"]), (4, [])):
+        adapter.captured.clear()
+        adapter._vars_page({"kind": "var", "offset": offset, "limit": 2})
+        payload = jsonlib.loads(node_eval(prefix, adapter.captured[-1]).get("r") or "{}")
+        items = payload.get("items") or []
+        check(
+            f"vars.page offset={offset} returns the requested window",
+            payload.get("total") == 4 and [row["name"] for row in items] == expected_names,
+            str(payload),
+        )
+
+    for offset, expected_names in ((0, ["v[1]"]), (1, ["v[3]"]), (2, ["v[4]"]), (3, [])):
+        adapter.captured.clear()
+        adapter._vars_search({"kind": "var", "q": "alpha", "offset": offset, "limit": 1})
+        payload = jsonlib.loads(node_eval(prefix, adapter.captured[-1]).get("r") or "{}")
+        items = payload.get("items") or []
+        check(
+            f"vars.search offset={offset} counts all matches before paging",
+            payload.get("total") == 3 and payload.get("offset") == offset
+            and [row["name"] for row in items] == expected_names,
+            str(payload),
+        )
+
+    adapter.captured.clear()
+    adapter._vars_search({"kind": "switch", "q": "even", "offset": 1, "limit": 1})
+    payload = jsonlib.loads(node_eval(prefix, adapter.captured[-1]).get("r") or "{}")
+    items = payload.get("items") or []
+    check(
+        "switch search uses the same matched-total/window semantics",
+        payload.get("total") == 2 and [row["name"] for row in items] == ["s[3]"],
+        str(payload),
+    )
+
+
 def test_teleport_bounds() -> None:
     adapter = fake_mv()
     calls: list[str] = []
@@ -208,6 +254,60 @@ def test_teleport_bounds() -> None:
     }
     result = adapter._player_teleport({"map": 1, "x": 3, "y": 4})
     check("valid teleport sends reserveTransfer", result["ok"] and bool(calls))
+
+
+def test_save_formats_and_memory_boundaries() -> None:
+    adapter = fake_mv()
+    data = {"party": {"_gold": 7}, "variables": {"_data": [0, 42]}}
+    with tempfile.TemporaryDirectory(prefix="kaze-save-test-") as temporary:
+        path = os.path.join(temporary, "synthetic.rpgsave")
+        original = mvmz_adapter.lzstring.compress_to_base64(jsonlib.dumps(data)).encode("ascii")
+        with open(path, "wb") as handle:
+            handle.write(original)
+        _decoded, encoding = adapter._decode_save_format(path)
+        data["party"]["_gold"] = 99
+        adapter._encode_save(path, data)
+        with open(path, "rb") as handle:
+            rewritten = handle.read()
+        try:
+            decoded = jsonlib.loads(mvmz_adapter.lzstring.decompress_base64(rewritten.decode("ascii")))
+        except Exception:
+            decoded = {}
+        check(
+            "MV base64 save keeps base64 encoding after patch",
+            encoding == "lz-base64" and decoded == data,
+            f"encoding={encoding} prefix={rewritten[:12]!r}",
+        )
+        with open(path + ".kaze-backup", "rb") as handle:
+            check("save patch preserves the original backup bytes", handle.read() == original)
+
+        binary = mvmz_adapter.lzstring.compress_to_uint8array(jsonlib.dumps(data))
+        with open(path, "wb") as handle:
+            handle.write(binary)
+        adapter._encode_save(path, data)
+        with open(path, "rb") as handle:
+            rewritten_binary = handle.read()
+        try:
+            decoded_binary = jsonlib.loads(mvmz_adapter.lzstring.decompress_uint8array(rewritten_binary))
+        except Exception:
+            decoded_binary = {}
+        check("MZ uint8array save keeps binary encoding after patch", decoded_binary == data)
+
+    memory = object.__new__(memory_adapter.MemoryAdapter)
+    needle = b"\x2a\x00\x00\x00"
+    payload = b"abc" + needle + b"xyz"
+    memory._regions = lambda: [(0x1000, len(payload))]
+    memory._read = lambda address, size: payload[address - 0x1000:address - 0x1000 + size]
+    previous_chunk = memory_adapter.CHUNK
+    memory_adapter.CHUNK = 4
+    try:
+        hits = memory._scan(42, "int")
+        check("value scan finds an int32 across CHUNK boundaries", hits == [0x1003], str(hits))
+        wildcard_hits = memory._aob_scan("?? 2A ??")
+        check("AOB wildcard-first pattern works across CHUNK boundaries", wildcard_hits == [0x1002], str(wildcard_hits))
+        check("AOB all-wildcard pattern is rejected without TypeError", memory._aob_scan("?? ??") == [])
+    finally:
+        memory_adapter.CHUNK = previous_chunk
 
 
 def test_renpy_values() -> None:
@@ -232,6 +332,8 @@ def main() -> int:
     test_map_grid()
     test_kind_priority()
     test_var_labels()
+    test_var_pagination()
+    test_save_formats_and_memory_boundaries()
     test_teleport_bounds()
     test_renpy_values()
     print()

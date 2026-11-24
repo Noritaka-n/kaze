@@ -13,6 +13,11 @@ import java.util.concurrent.atomic.AtomicLong
 
 
 class RelayClient(private val transport: NamedPipeTransport) : Closeable {
+    companion object {
+        private const val HANDSHAKE_TIMEOUT_MS = 5_000L
+        const val FRAME_READ_TIMEOUT_MS = 10_000L
+    }
+
     private val seq = AtomicLong(0)
 
     @Volatile
@@ -35,9 +40,13 @@ class RelayClient(private val transport: NamedPipeTransport) : Closeable {
             .build()
 
         send(hello)
-        val reply = receive() ?: throw IllegalStateException("relay closed during handshake")
+        val reply = receive(HANDSHAKE_TIMEOUT_MS)
+            ?: throw IllegalStateException("relay closed during handshake")
         if (reply.bodyCase == Envelope.BodyCase.ERROR) {
             throw IllegalStateException("relay rejected: ${reply.error.code} ${reply.error.message}")
+        }
+        if (reply.bodyCase != Envelope.BodyCase.WELCOME) {
+            throw IllegalStateException("unexpected handshake reply: ${reply.bodyCase}")
         }
         val value = reply.welcome
         welcome = value
@@ -50,14 +59,23 @@ class RelayClient(private val transport: NamedPipeTransport) : Closeable {
 
     fun available(): Int = transport.available()
 
-    fun receive(): Envelope? {
+    fun receive(timeoutMillis: Long? = null): Envelope? {
+        val started = System.nanoTime()
         val header = try {
-            transport.readExact(KzCodec.HEADER)
+            transport.readExact(KzCodec.HEADER, timeoutMillis)
         } catch (_: EOFException) {
             return null
         }
         val decoded = KzCodec.decodeHeader(header)
-        val payload = if (decoded.length == 0) ByteArray(0) else transport.readExact(decoded.length)
+        val remainingTimeout = timeoutMillis?.let {
+            val elapsedMs = (System.nanoTime() - started) / 1_000_000L
+            (it - elapsedMs).coerceAtLeast(1L)
+        }
+        val payload = if (decoded.length == 0) {
+            ByteArray(0)
+        } else {
+            transport.readExact(decoded.length, remainingTimeout)
+        }
         return Envelope.parseFrom(payload)
     }
 
@@ -76,6 +94,8 @@ class RelayClient(private val transport: NamedPipeTransport) : Closeable {
         Envelope.BodyCase.CONTROL -> MsgType.CONTROL
         Envelope.BodyCase.PING -> MsgType.PING
         Envelope.BodyCase.PONG -> MsgType.PONG
+        Envelope.BodyCase.INVOKE_REQUEST -> MsgType.INVOKE_REQUEST
+        Envelope.BodyCase.INVOKE_RESULT -> MsgType.INVOKE_RESULT
         else -> 0
     }
 }
@@ -93,4 +113,6 @@ object MsgType {
     const val CONTROL = 10
     const val PING = 11
     const val PONG = 12
+    const val INVOKE_REQUEST = 13
+    const val INVOKE_RESULT = 14
 }

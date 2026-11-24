@@ -13,37 +13,93 @@ import java.sql.DriverManager
 
 
 object TranslationMemory {
-    private val dbFile: Path = run {
+    private val defaultDbFile: Path = run {
         val base = System.getenv("APPDATA") ?: System.getProperty("user.home")
         Paths.get(base, "Kaze", "translation.db")
     }
 
+    internal var dbFileOverride: Path? = null
+
+    @Volatile
     private var connection: Connection? = null
     private val lock = Any()
 
+    @Volatile
     var available: Boolean = false
         private set
 
+    @Volatile
     var count: Int = 0
         private set
 
+    @Volatile
     var lastError: String? = null
         private set
 
-    fun path(): String = dbFile.toString()
+    private fun dbFile(): Path = dbFileOverride ?: defaultDbFile
+
+    fun path(): String = dbFile().toString()
 
     fun open() {
-        if (connection != null) return
         synchronized(lock) {
+            if (connection != null) return
+            available = false
+            lastError = null
+            var conn: Connection? = null
             try {
-                Files.createDirectories(dbFile.parent)
-                
-                if (Files.exists(dbFile)) {
-                    val backup = dbFile.resolveSibling("translation.db.bak")
-                    runCatching { Files.copy(dbFile, backup, java.nio.file.StandardCopyOption.REPLACE_EXISTING) }
-                }
+                val db = dbFile()
+                Files.createDirectories(db.parent)
                 Class.forName("org.sqlite.JDBC")
-                val conn = DriverManager.getConnection("jdbc:sqlite:$dbFile")
+
+                var failure: Throwable? = null
+                try {
+                    conn = prepare(db)
+                } catch (t: Throwable) {
+                    failure = t
+                }
+
+                val backup = backupFile(db)
+                if (conn == null && isCorruption(failure) && Files.isRegularFile(backup)) {
+                    validateBackup(backup)
+                    restoreBackup(backup, db)
+                    conn = prepare(db)
+                }
+                if (conn == null) throw failure ?: IllegalStateException("无法打开翻译记忆库")
+
+                connection = conn
+                backfillNorm(conn)
+                refreshCount()
+                available = true
+                runCatching { backupMain(db) }
+            } catch (t: Throwable) {
+                runCatching { conn?.close() }
+                connection = null
+                available = false
+                lastError = t.message ?: t.javaClass.simpleName
+            }
+        }
+    }
+
+    fun close() = synchronized(lock) {
+        val conn = connection
+        connection = null
+        available = false
+        runCatching { conn?.close() }
+    }
+
+    private fun backupFile(db: Path): Path = db.resolveSibling("${db.fileName}.bak")
+
+    private fun isCorruption(error: Throwable?): Boolean = generateSequence(error) { it.cause }.any {
+        val message = it.message.orEmpty().lowercase()
+        "not a database" in message || "malformed" in message || "corrupt" in message
+    }
+
+    private fun prepare(db: Path): Connection {
+        val conn = DriverManager.getConnection("jdbc:sqlite:$db")
+        try {
+            checkIntegrity(conn)
+            conn.autoCommit = false
+            try {
                 conn.createStatement().use { statement ->
                     migrateToGameDimension(statement)
                     statement.executeUpdate(
@@ -77,15 +133,70 @@ object TranslationMemory {
                         """.trimIndent()
                     )
                 }
-                connection = conn
-                available = true
-                backfillNorm(conn)
-                refreshCount()
+                conn.commit()
             } catch (t: Throwable) {
-                available = false
-                lastError = t.message ?: t.javaClass.simpleName
+                runCatching { conn.rollback() }
+                throw t
+            } finally {
+                conn.autoCommit = true
+            }
+            return conn
+        } catch (t: Throwable) {
+            runCatching { conn.close() }
+            throw t
+        }
+    }
+
+    private fun checkIntegrity(conn: Connection) {
+        conn.createStatement().use { statement ->
+            statement.executeQuery("PRAGMA integrity_check").use { rs ->
+                var valid = false
+                while (rs.next()) {
+                    if (rs.getString(1).equals("ok", ignoreCase = true)) valid = true
+                    else throw IllegalStateException("SQLite 校验失败：${rs.getString(1)}")
+                }
+                if (!valid) throw IllegalStateException("SQLite 校验没有返回结果")
             }
         }
+    }
+
+    private fun validateBackup(backup: Path) {
+        DriverManager.getConnection("jdbc:sqlite:$backup").use { conn ->
+            checkIntegrity(conn)
+            conn.createStatement().use { statement ->
+                statement.executeQuery(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='memory'",
+                ).use { rs ->
+                    if (!rs.next()) throw IllegalStateException("备份中没有 memory 表")
+                }
+            }
+        }
+    }
+
+    private fun replaceFile(temp: Path, target: Path) {
+        try {
+            Files.move(
+                temp,
+                target,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+            )
+        } catch (_: Throwable) {
+            Files.move(temp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
+
+    private fun restoreBackup(backup: Path, db: Path) {
+        val temp = db.resolveSibling("${db.fileName}.restore.tmp")
+        Files.copy(backup, temp, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        replaceFile(temp, db)
+    }
+
+    private fun backupMain(db: Path) {
+        val backup = backupFile(db)
+        val temp = db.resolveSibling("${db.fileName}.bak.tmp")
+        Files.copy(db, temp, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        replaceFile(temp, backup)
     }
 
     
@@ -95,16 +206,16 @@ object TranslationMemory {
                 return rs.next()
             }
         }
-        fun hasGameColumn(name: String): Boolean {
-            statement.executeQuery("PRAGMA table_info($name)").use { rs ->
+        fun hasColumn(table: String, column: String): Boolean {
+            statement.executeQuery("PRAGMA table_info($table)").use { rs ->
                 while (rs.next()) {
-                    if (rs.getString("name") == "game") return true
+                    if (rs.getString("name") == column) return true
                 }
             }
             return false
         }
 
-        if (hasTable("memory") && !hasGameColumn("memory")) {
+        if (hasTable("memory") && !hasColumn("memory", "game")) {
             statement.executeUpdate("ALTER TABLE memory RENAME TO memory_legacy")
             statement.executeUpdate(
                 """
@@ -121,16 +232,17 @@ object TranslationMemory {
                 )
                 """.trimIndent()
             )
+            val norm = if (hasColumn("memory_legacy", "norm")) "norm" else "NULL"
             statement.executeUpdate(
                 """
                 INSERT INTO memory(game, key, source, target, provider, model, norm, updated_at)
-                SELECT '', key, source, target, provider, model, norm, updated_at FROM memory_legacy
+                SELECT '', key, source, target, provider, model, $norm, updated_at FROM memory_legacy
                 """.trimIndent()
             )
             statement.executeUpdate("DROP TABLE memory_legacy")
         }
 
-        if (hasTable("glossary") && !hasGameColumn("glossary")) {
+        if (hasTable("glossary") && !hasColumn("glossary", "game")) {
             statement.executeUpdate("ALTER TABLE glossary RENAME TO glossary_legacy")
             statement.executeUpdate(
                 """
@@ -151,18 +263,19 @@ object TranslationMemory {
 
     private fun backfillNorm(conn: Connection) {
         runCatching {
-            val pending = ArrayList<Pair<String, String>>()
+            val pending = ArrayList<Triple<String, String, String>>()
             conn.createStatement().use { statement ->
-                statement.executeQuery("SELECT key, source FROM memory WHERE norm IS NULL").use { rs ->
-                    while (rs.next()) pending += rs.getString(1) to rs.getString(2)
+                statement.executeQuery("SELECT game, key, source FROM memory WHERE norm IS NULL").use { rs ->
+                    while (rs.next()) pending += Triple(rs.getString(1), rs.getString(2), rs.getString(3))
                 }
             }
             if (pending.isEmpty()) return
 
-            conn.prepareStatement("UPDATE memory SET norm = ? WHERE key = ?").use { statement ->
-                pending.forEach { (key, source) ->
+            conn.prepareStatement("UPDATE memory SET norm = ? WHERE game = ? AND key = ?").use { statement ->
+                pending.forEach { (game, key, source) ->
                     statement.setString(1, normalize(source))
-                    statement.setString(2, key)
+                    statement.setString(2, game)
+                    statement.setString(3, key)
                     statement.addBatch()
                 }
                 statement.executeBatch()
@@ -355,20 +468,21 @@ object TranslationMemory {
         synchronized(lock) {
             runCatching {
                 val sql = if (game == null) {
-                    "SELECT key, source, target, provider, model FROM memory ORDER BY updated_at"
+                    "SELECT game, key, source, target, provider, model FROM memory ORDER BY updated_at"
                 } else {
-                    "SELECT key, source, target, provider, model FROM memory WHERE game = ? ORDER BY updated_at"
+                    "SELECT game, key, source, target, provider, model FROM memory WHERE game = ? ORDER BY updated_at"
                 }
                 conn.prepareStatement(sql).use { statement ->
                     if (game != null) statement.setString(1, game)
                     statement.executeQuery().use { rs ->
                         while (rs.next()) {
                             entries += com.google.gson.JsonObject().apply {
-                                addProperty("key", rs.getString(1))
-                                addProperty("source", rs.getString(2))
-                                addProperty("target", rs.getString(3))
-                                addProperty("provider", rs.getString(4) ?: "")
-                                addProperty("model", rs.getString(5) ?: "")
+                                addProperty("game", rs.getString(1))
+                                addProperty("key", rs.getString(2))
+                                addProperty("source", rs.getString(3))
+                                addProperty("target", rs.getString(4))
+                                addProperty("provider", rs.getString(5) ?: "")
+                                addProperty("model", rs.getString(6) ?: "")
                             }
                         }
                     }
@@ -377,7 +491,7 @@ object TranslationMemory {
         }
         val root = com.google.gson.JsonObject().apply {
             addProperty("format", "kaze-tm")
-            addProperty("version", 1)
+            addProperty("version", 2)
             addProperty("exportedAt", java.time.Instant.now().toString())
             addProperty("count", entries.size)
             add("entries", com.google.gson.JsonArray().apply { entries.forEach { add(it) } })
@@ -392,43 +506,60 @@ object TranslationMemory {
         val text = Files.readString(path)
         val root = runCatching { com.google.gson.JsonParser.parseString(text).asJsonObject }.getOrNull()
             ?: return 0 to 0
-        if (root.get("format")?.asString != "kaze-tm") return 0 to 0
-        val entries = root.getAsJsonArray("entries") ?: return 0 to 0
+        if (runCatching { root.get("format")?.asString }.getOrNull() != "kaze-tm") return 0 to 0
+        val entries = runCatching { root.getAsJsonArray("entries") }.getOrNull() ?: return 0 to 0
 
-        var imported = 0
-        var skipped = 0
-        conn.prepareStatement(
-            """
-            INSERT INTO memory(game, key, source, target, provider, model, norm, updated_at)
-            VALUES('', ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(game, key) DO UPDATE SET
-                target = excluded.target, norm = excluded.norm, updated_at = excluded.updated_at
-            """.trimIndent()
-        ).use { statement ->
-            entries.forEach { element ->
-                val item = runCatching { element.asJsonObject }.getOrNull()
-                val key = item?.get("key")?.asString
-                val source = item?.get("source")?.asString
-                val target = item?.get("target")?.asString
-                if (key.isNullOrBlank() || source.isNullOrBlank() || target.isNullOrBlank()) {
-                    skipped++
-                    return@forEach
+        fun value(item: com.google.gson.JsonObject, name: String): String? = runCatching {
+            item.get(name)?.takeIf { it.isJsonPrimitive }?.asString
+        }.getOrNull()
+
+        synchronized(lock) {
+            var imported = 0
+            var skipped = 0
+            conn.prepareStatement(
+                """
+                INSERT INTO memory(game, key, source, target, provider, model, norm, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(game, key) DO UPDATE SET
+                    source = excluded.source,
+                    target = excluded.target,
+                    provider = excluded.provider,
+                    model = excluded.model,
+                    norm = excluded.norm,
+                    updated_at = excluded.updated_at
+                """.trimIndent()
+            ).use { statement ->
+                entries.forEach { element ->
+                    val item = runCatching { element.asJsonObject }.getOrNull()
+                    if (item == null) {
+                        skipped++
+                        return@forEach
+                    }
+                    val game = value(item, "game").orEmpty()
+                    val key = value(item, "key")
+                    val source = value(item, "source")
+                    val target = value(item, "target")
+                    if (key.isNullOrBlank() || source.isNullOrBlank() || target.isNullOrBlank()) {
+                        skipped++
+                        return@forEach
+                    }
+                    runCatching {
+                        statement.setString(1, game)
+                        statement.setString(2, key)
+                        statement.setString(3, source)
+                        statement.setString(4, target)
+                        statement.setString(5, value(item, "provider") ?: "patch")
+                        statement.setString(6, value(item, "model") ?: "patch")
+                        statement.setString(7, normalize(source))
+                        statement.setLong(8, System.currentTimeMillis())
+                        statement.executeUpdate()
+                        imported++
+                    }.onFailure { skipped++ }
                 }
-                runCatching {
-                    statement.setString(1, key)
-                    statement.setString(2, source)
-                    statement.setString(3, target)
-                    statement.setString(4, item.get("provider")?.asString ?: "patch")
-                    statement.setString(5, item.get("model")?.asString ?: "patch")
-                    statement.setString(6, normalize(source))
-                    statement.setLong(7, System.currentTimeMillis())
-                    statement.executeUpdate()
-                    imported++
-                }.onFailure { skipped++ }
             }
+            refreshCount()
+            return imported to skipped
         }
-        refreshCount()
-        return imported to skipped
     }
 
     
@@ -436,21 +567,22 @@ object TranslationMemory {
     fun exportCsv(path: Path): Int {
         val conn = connection ?: return 0
         val rows = ArrayList<String>()
-        rows += "key,source,target,provider,model,updated_at"
+        rows += "game,key,source,target,provider,model,updated_at"
         synchronized(lock) {
             runCatching {
                 conn.createStatement().use { statement ->
                     statement.executeQuery(
-                        "SELECT key, source, target, provider, model, updated_at FROM memory ORDER BY updated_at"
+                        "SELECT game, key, source, target, provider, model, updated_at FROM memory ORDER BY updated_at"
                     ).use { rs ->
                         while (rs.next()) {
                             rows += listOf(
                                 rs.getString(1),
                                 rs.getString(2),
                                 rs.getString(3),
-                                rs.getString(4) ?: "",
+                                rs.getString(4),
                                 rs.getString(5) ?: "",
-                                rs.getLong(6).toString(),
+                                rs.getString(6) ?: "",
+                                rs.getLong(7).toString(),
                             ).joinToString(",") { csvEscape(it) }
                         }
                     }
@@ -463,39 +595,66 @@ object TranslationMemory {
 
     fun importCsv(path: Path): Pair<Int, Int> {
         val conn = connection ?: return 0 to 0
-        val lines = Files.readAllLines(path, Charsets.UTF_8)
-        var imported = 0
-        var skipped = 0
-
-        conn.prepareStatement(
-            """
-            INSERT INTO memory(game, key, source, target, provider, model, norm, updated_at)
-            VALUES('', ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(game, key) DO UPDATE SET
-                target = excluded.target, norm = excluded.norm, updated_at = excluded.updated_at
-            """.trimIndent()
-        ).use { statement ->
-            lines.drop(1).forEach { line ->
-                val cells = parseCsvLine(line)
-                if (cells.size < 3 || cells[1].isBlank() || cells[2].isBlank()) {
-                    skipped++
-                    return@forEach
-                }
-                runCatching {
-                    statement.setString(1, cells[0])
-                    statement.setString(2, cells[1])
-                    statement.setString(3, cells[2])
-                    statement.setString(4, cells.getOrNull(3) ?: "")
-                    statement.setString(5, cells.getOrNull(4) ?: "")
-                    statement.setString(6, normalize(cells[1]))
-                    statement.setLong(7, System.currentTimeMillis())
-                    statement.executeUpdate()
-                    imported++
-                }.onFailure { skipped++ }
-            }
+        val records = runCatching { parseCsv(Files.readString(path, Charsets.UTF_8)) }.getOrNull()
+            ?: return 0 to 0
+        val rawHeader = records.firstOrNull() ?: return 0 to 0
+        val header = rawHeader.mapIndexed { index, value ->
+            if (index == 0) value.removePrefix("\uFEFF") else value
         }
-        refreshCount()
-        return imported to skipped
+        val columns = header.mapIndexed { index, name -> name to index }.toMap()
+        val keyColumn = columns["key"] ?: 0
+        val sourceColumn = columns["source"] ?: 1
+        val targetColumn = columns["target"] ?: 2
+        val gameColumn = columns["game"] ?: -1
+        val providerColumn = columns["provider"] ?: 3
+        val modelColumn = columns["model"] ?: 4
+
+        fun cell(cells: List<String>, index: Int): String =
+            if (index >= 0) cells.getOrElse(index) { "" } else ""
+
+        synchronized(lock) {
+            var imported = 0
+            var skipped = 0
+            conn.prepareStatement(
+                """
+                INSERT INTO memory(game, key, source, target, provider, model, norm, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(game, key) DO UPDATE SET
+                    source = excluded.source,
+                    target = excluded.target,
+                    provider = excluded.provider,
+                    model = excluded.model,
+                    norm = excluded.norm,
+                    updated_at = excluded.updated_at
+                """.trimIndent()
+            ).use { statement ->
+                records.drop(1).forEach { cells ->
+                    if (cells.all { it.isEmpty() }) return@forEach
+                    val game = cell(cells, gameColumn)
+                    val key = cell(cells, keyColumn)
+                    val source = cell(cells, sourceColumn)
+                    val target = cell(cells, targetColumn)
+                    if (key.isBlank() || source.isBlank() || target.isBlank()) {
+                        skipped++
+                        return@forEach
+                    }
+                    runCatching {
+                        statement.setString(1, game)
+                        statement.setString(2, key)
+                        statement.setString(3, source)
+                        statement.setString(4, target)
+                        statement.setString(5, cell(cells, providerColumn))
+                        statement.setString(6, cell(cells, modelColumn))
+                        statement.setString(7, normalize(source))
+                        statement.setLong(8, System.currentTimeMillis())
+                        statement.executeUpdate()
+                        imported++
+                    }.onFailure { skipped++ }
+                }
+            }
+            refreshCount()
+            return imported to skipped
+        }
     }
 
     private fun csvEscape(value: String): String =
@@ -505,26 +664,43 @@ object TranslationMemory {
             value
         }
 
-    private fun parseCsvLine(line: String): List<String> {
-        val out = ArrayList<String>()
-        val current = StringBuilder()
+    private fun parseCsv(text: String): List<List<String>> {
+        val records = ArrayList<List<String>>()
+        val record = ArrayList<String>()
+        val field = StringBuilder()
         var inQuotes = false
+
+        fun finishField() {
+            record += field.toString()
+            field.clear()
+        }
+
+        fun finishRecord() {
+            finishField()
+            records += record.toList()
+            record.clear()
+        }
+
         var i = 0
-        while (i < line.length) {
-            val ch = line[i]
+        while (i < text.length) {
+            val ch = text[i]
             when {
-                inQuotes && ch == '"' && i + 1 < line.length && line[i + 1] == '"' -> {
-                    current.append('"'); i++
+                inQuotes && ch == '"' && i + 1 < text.length && text[i + 1] == '"' -> {
+                    field.append('"')
+                    i++
                 }
                 ch == '"' -> inQuotes = !inQuotes
-                ch == ',' && !inQuotes -> {
-                    out += current.toString(); current.clear()
+                !inQuotes && ch == ',' -> finishField()
+                !inQuotes && (ch == '\n' || ch == '\r') -> {
+                    finishRecord()
+                    if (ch == '\r' && i + 1 < text.length && text[i + 1] == '\n') i++
                 }
-                else -> current.append(ch)
+                else -> field.append(ch)
             }
             i++
         }
-        out += current.toString()
-        return out
+        if (inQuotes) throw IllegalArgumentException("CSV 引号未闭合")
+        if (field.isNotEmpty() || record.isNotEmpty()) finishRecord()
+        return records
     }
 }

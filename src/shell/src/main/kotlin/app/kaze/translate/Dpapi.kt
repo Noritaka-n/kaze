@@ -1,12 +1,12 @@
 package app.kaze.translate
 
-import com.sun.jna.Library
 import com.sun.jna.Memory
 import com.sun.jna.Native
 import com.sun.jna.Pointer
 import com.sun.jna.Structure
 import com.sun.jna.WString
 import com.sun.jna.ptr.PointerByReference
+import com.sun.jna.win32.StdCallLibrary
 
 
 
@@ -21,7 +21,11 @@ object Dpapi {
         @JvmField var pbData: Pointer? = null
     }
 
-    private interface Crypt32 : Library {
+    private interface Kernel32 : StdCallLibrary {
+        fun LocalFree(pointer: Pointer): Pointer?
+    }
+
+    private interface Crypt32 : StdCallLibrary {
         fun CryptProtectData(
             dataIn: DataBlob,
             description: WString?,
@@ -44,6 +48,7 @@ object Dpapi {
     }
 
     private val crypt32: Crypt32? = runCatching { Native.load("crypt32", Crypt32::class.java) }.getOrNull()
+    private val kernel32: Kernel32? = runCatching { Native.load("kernel32", Kernel32::class.java) }.getOrNull()
 
     private fun toBlob(bytes: ByteArray): Pair<DataBlob, Memory> {
         val memory = Memory(bytes.size.toLong().coerceAtLeast(1))
@@ -73,7 +78,7 @@ object Dpapi {
         return try {
             pointer.getByteArray(0, output.cbData)
         } finally {
-            Native.free(Pointer.nativeValue(pointer))
+            kernel32?.LocalFree(pointer)
         }
     }
 
@@ -96,7 +101,7 @@ object Dpapi {
         return try {
             pointer.getByteArray(0, output.cbData)
         } finally {
-            Native.free(Pointer.nativeValue(pointer))
+            kernel32?.LocalFree(pointer)
         }
     }
 }

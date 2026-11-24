@@ -130,7 +130,7 @@ class MemoryAdapter:
 
     def _processes(self) -> list[dict]:
         """Enumerates every process (not just windowed ones)."""
-        result = []
+        result: list[dict] = []
         try:
             count = 1024
             while True:
@@ -209,19 +209,30 @@ class MemoryAdapter:
         return None
 
     def _aob_scan(self, pattern: str, module_name: str = "", limit: int = 32) -> list[int]:
-        """Byte pattern with ?? wildcards, e.g. '48 8B 05 ?? ?? ?? ?? 89'."""
+        """Byte pattern with ?? wildcards, including wildcard-first signatures."""
         tokens = pattern.replace(",", " ").split()
         if not tokens:
             return []
-        values = []
+        values: list[int | None] = []
         for token in tokens:
             if token in ("?", "??", "**"):
                 values.append(None)
             else:
-                values.append(int(token, 16))
+                value = int(token, 16)
+                if not 0 <= value <= 0xFF:
+                    raise ValueError(f"AOB byte out of range: {token}")
+                values.append(value)
         needle_length = len(values)
         if needle_length < 2:
             return []
+        fixed = [index for index, value in enumerate(values) if value is not None]
+        if not fixed:
+            return []
+        anchor = fixed[0]
+        anchor_value = values[anchor]
+        if anchor_value is None:
+            return []
+        anchor_byte = bytes([anchor_value])
 
         if module_name:
             found = self._module_range(module_name)
@@ -233,36 +244,44 @@ class MemoryAdapter:
             regions = self._regions()
 
         hits: list[int] = []
+        seen: set[int] = set()
+        chunk_size = max(CHUNK, needle_length)
+        step = max(1, chunk_size - needle_length + 1)
         for base, size in regions:
             offset = 0
             while offset < size and len(hits) < limit:
-                length = min(CHUNK, size - offset)
+                length = min(chunk_size, size - offset)
                 data = self._read(base + offset, length)
                 if not data:
-                    offset += CHUNK
+                    offset += step
                     continue
                 start = 0
                 while len(hits) < limit:
-                    index = data.find(bytes([values[0]]), start)
+                    index = data.find(anchor_byte, start)
                     if index < 0:
                         break
                     start = index + 1
-                    if index + needle_length > len(data):
+                    candidate = index - anchor
+                    if candidate < 0:
+                        continue
+                    if candidate + needle_length > len(data):
                         break
                     matched = True
-                    for shift in range(1, needle_length):
-                        expected = values[shift]
-                        if expected is not None and data[index + shift] != expected:
+                    for shift, expected in enumerate(values):
+                        if expected is not None and data[candidate + shift] != expected:
                             matched = False
                             break
                     if matched:
-                        hits.append(base + offset + index)
-                offset += CHUNK
+                        hit = base + offset + candidate
+                        if hit not in seen:
+                            seen.add(hit)
+                            hits.append(hit)
+                offset += step
         return hits
 
     def _read_pointer(self, address: int) -> int:
         data = self._read(address, 8)
-        if not data:
+        if data is None or len(data) != 8:
             return 0
         return struct.unpack("<Q", data)[0]
     def _attach(self, target) -> dict:
@@ -333,19 +352,25 @@ class MemoryAdapter:
     def _scan(self, value, type_name: str) -> list[int]:
         pattern = encode(value, type_name)
         found: list[int] = []
+        seen: set[int] = set()
+        chunk_size = max(CHUNK, len(pattern))
+        step = max(1, chunk_size - len(pattern) + 1)
         for base, size in self._regions():
             offset = 0
             while offset < size and len(found) < MAX_RESULTS:
-                length = min(CHUNK, size - offset)
+                length = min(chunk_size, size - offset)
                 data = self._read(base + offset, length)
                 if not data:
-                    offset += CHUNK
+                    offset += step
                     continue
                 index = data.find(pattern)
                 while index >= 0 and len(found) < MAX_RESULTS:
-                    found.append(base + offset + index)
+                    hit = base + offset + index
+                    if hit not in seen:
+                        seen.add(hit)
+                        found.append(hit)
                     index = data.find(pattern, index + 1)
-                offset += CHUNK
+                offset += step
         return found
 
                                                                          
@@ -400,6 +425,8 @@ class MemoryAdapter:
                                              len(payload), ctypes.byref(written))
             if not ok:
                 return {"ok": False, "detail": f"写入失败：{ctypes.get_last_error()}"}
+            if written.value != len(payload):
+                return {"ok": False, "detail": f"写入不完整：{written.value}/{len(payload)} 字节"}
             return {"ok": True, "detail": f"已写入 0x{address:X}"}
         if op == "mem.read":
             if not self.handle:
@@ -408,8 +435,8 @@ class MemoryAdapter:
             type_name = str(args.get("type", "int"))
             size = struct.calcsize("<" + type_format(type_name))
             data = self._read(address, size)
-            if not data:
-                return {"ok": False, "detail": "读取失败"}
+            if data is None or len(data) != size:
+                return {"ok": False, "detail": "读取失败或不完整"}
             return {"ok": True, "detail": str(decode(data, type_name)),
                     "data_json": json.dumps({"value": decode(data, type_name)})}
         if op == "mem.modules":
@@ -443,7 +470,7 @@ class MemoryAdapter:
             size = struct.calcsize("<" + type_format(self.last_type))
             for address in self.candidates[:MAX_RESULTS]:
                 data = self._read(address, size)
-                if data:
+                if data is not None and len(data) == size:
                     rows.append({"address": address, "hex": f"0x{address:X}",
                                  "value": decode(data, self.last_type)})
             return {"ok": True, "detail": f"{len(rows)} 条",

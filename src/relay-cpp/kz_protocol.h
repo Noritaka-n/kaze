@@ -12,6 +12,7 @@ constexpr uint32_t kMagic = 0x00315A4B;
 constexpr uint8_t kVersion = 1;
 constexpr int kHeaderSize = 20;
 constexpr uint32_t kMaxPayload = 1u << 20;
+constexpr int kFrameReadTimeoutMs = 5000;
 
 struct Frame {
     uint8_t version = kVersion;
@@ -35,10 +36,13 @@ enum MsgType : uint8_t {
     kControl = 10,
     kPing = 11,
     kPong = 12,
+    kInvokeRequest = 13,
+    kInvokeResult = 14,
 };
 
-bool ReadFrame(HANDLE pipe, Frame& out, std::string& error);
+bool ReadFrame(HANDLE pipe, Frame& out, std::string& error,
+               int timeout_ms = kFrameReadTimeoutMs);
 bool WriteFrame(HANDLE pipe, const Frame& frame, std::string& error);
-int PeekAvailable(HANDLE pipe);
+bool PeekAvailable(HANDLE pipe, DWORD& available, std::string& error);
 
 }  

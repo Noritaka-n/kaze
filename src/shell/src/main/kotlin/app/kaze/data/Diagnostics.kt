@@ -1,5 +1,7 @@
 package app.kaze.data
 
+import app.kaze.translate.SettingsStore
+import app.kaze.translate.TranslationMemory
 import java.io.File
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
@@ -11,21 +13,27 @@ import java.util.zip.ZipOutputStream
 
 
 object Diagnostics {
-    private val baseDir: File =
+    private val defaultBaseDir: File =
         File(System.getenv("LOCALAPPDATA") ?: System.getProperty("user.home"), "Kaze")
 
-    val logDir: File get() = File(baseDir, "logs")
-    val sessionDir: File get() = File(baseDir, "session")
+    internal var baseDirOverride: File? = null
+    internal var workingDirOverride: File? = null
+
+    private fun baseDir(): File = baseDirOverride ?: defaultBaseDir
+    private fun workingDir(): File = workingDirOverride ?: File(System.getProperty("user.dir"))
+
+    val logDir: File get() = File(baseDir(), "logs")
+    val sessionDir: File get() = File(baseDir(), "session")
 
     fun knownFiles(): List<File> {
         val candidates = mutableListOf<File>()
-        candidates += File(baseDir, "library.json")
-        candidates += File(baseDir, "translation.db")
-        candidates += File(System.getenv("APPDATA") ?: "", "Kaze/settings.json")
+        candidates += File(LibraryStore.path())
+        candidates += File(TranslationMemory.path())
+        candidates += File(SettingsStore.settingsPath())
         candidates += sessionDir.listFiles().orEmpty().toList()
-        candidates += File(System.getProperty("user.dir"), "adapters/mvmz/adapter-run.log")
-        candidates += File(System.getProperty("user.dir"), "adapters/mvmz/adapter-run.err")
-        candidates += File(System.getProperty("user.dir"), "adapters/renpy/adapter-run.log")
+        candidates += File(workingDir(), "adapters/mvmz/adapter-run.log")
+        candidates += File(workingDir(), "adapters/mvmz/adapter-run.err")
+        candidates += File(workingDir(), "adapters/renpy/adapter-run.log")
         return candidates.filter { it.exists() && it.isFile }
     }
 
@@ -60,18 +68,32 @@ object Diagnostics {
     
     fun exportBundle(): Result<File> = runCatching {
         val stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
-        val out = File(baseDir, "diagnostics-$stamp.zip")
+        val out = File(baseDir(), "diagnostics-$stamp.zip")
+        out.parentFile?.mkdirs()
         ZipOutputStream(out.outputStream().buffered()).use { zip ->
+            val usedNames = HashSet<String>()
+            fun uniqueName(base: String): String {
+                var name = base
+                var suffix = 1
+                while (!usedNames.add(name)) name = "${suffix++}-$base"
+                return name
+            }
             knownFiles().forEach { file ->
-                val name = file.name
-                if (name.equals("translation.db", true)) {
-                    
-                    zip.putNextEntry(ZipEntry("translation.db.txt"))
+                val parent = file.parentFile?.name.orEmpty()
+                val baseName = when {
+                    file.name.startsWith("adapter-run") && parent.isNotEmpty() -> "adapters/$parent/${file.name}"
+                    file.parentFile == sessionDir -> "session/${file.name}"
+                    else -> file.name
+                }
+                val name = uniqueName(baseName)
+                if (file.name.equals("translation.db", true)) {
+                    val textName = uniqueName("translation.db.txt")
+                    zip.putNextEntry(ZipEntry(textName))
                     zip.write("size=${file.length()} bytes".toByteArray())
                     zip.closeEntry()
                     return@forEach
                 }
-                if (name.equals("settings.json", true)) {
+                if (file.name.equals("settings.json", true)) {
                     val redacted = file.readText(Charsets.UTF_8)
                         .replace(Regex("\"encryptedKey\"\\s*:\\s*\"[^\"]*\""), "\"encryptedKey\":\"\"")
                     zip.putNextEntry(ZipEntry(name))
@@ -84,7 +106,7 @@ object Diagnostics {
                 zip.closeEntry()
             }
 
-            zip.putNextEntry(ZipEntry("environment.txt"))
+            zip.putNextEntry(ZipEntry(uniqueName("environment.txt")))
             zip.write(
                 """
                 time=${LocalDateTime.now()}

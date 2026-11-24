@@ -121,6 +121,8 @@ uint8_t TypeOf(const kaze::v1::Envelope& envelope) {
         case kaze::v1::Envelope::kControl: return MsgType::kControl;
         case kaze::v1::Envelope::kPing: return MsgType::kPing;
         case kaze::v1::Envelope::kPong: return MsgType::kPong;
+        case kaze::v1::Envelope::kInvokeRequest: return MsgType::kInvokeRequest;
+        case kaze::v1::Envelope::kInvokeResult: return MsgType::kInvokeResult;
         default: return 0;
     }
 }
@@ -254,6 +256,7 @@ private:
         frame.payload = std::move(bytes);
 
         std::lock_guard<std::mutex> lock(conn.write_mutex);
+        if (!conn.alive.load()) return false;
         std::string error;
         if (!WriteFrame(conn.pipe, frame, error)) {
             conn.alive.store(false);
@@ -293,6 +296,7 @@ private:
         }
 
         conn->role = hello.hello().role();
+        conn->last_seen_ms.store(NowMillis());
 
         kaze::v1::Envelope welcome;
         welcome.set_msg_id(hello.msg_id());
@@ -304,24 +308,18 @@ private:
         body->add_caps("text.batch");
         body->add_caps("text.push");
         body->add_caps("adapter.fake");
-        Send(*conn, welcome);
+        if (!Send(*conn, welcome)) {
+            Close(conn);
+            return;
+        }
 
         if (conn->role == kaze::v1::ROLE_SHELL) {
-            
-            
             bool busy = false;
             {
                 std::lock_guard<std::mutex> lock(shell_mutex_);
-                if (shell_ && shell_->alive.load()) {
-                    const long long idle = NowMillis() - shell_->last_seen_ms.load();
-                    
-                    
-                    busy = idle < 20000;
-                    if (!busy) {
-                        std::printf("[relay] shell slot reclaimed (idle %lld ms)\n", idle);
-                        shell_.reset();
-                    }
-                }
+                if (shell_ && !shell_->alive.load()) shell_.reset();
+                busy = shell_ != nullptr;
+                if (!busy) shell_ = conn;
             }
             if (busy) {
                 std::printf("[relay] shell rejected (another shell is connected)\n");
@@ -332,9 +330,6 @@ private:
                 err->set_message("another shell is connected");
                 Send(*conn, reply);
                 conn->alive = false;
-            } else {
-                std::lock_guard<std::mutex> lock(shell_mutex_);
-                shell_ = conn;
             }
         } else if (conn->role == kaze::v1::ROLE_ADAPTER) {
             const std::string name = hello.hello().name();
@@ -350,7 +345,12 @@ private:
                     hello.hello().pid());
 
         while (!stop_.load() && conn->alive.load()) {
-            if (PeekAvailable(conn->pipe) < kaze::kHeaderSize) {
+            DWORD available = 0;
+            if (!PeekAvailable(conn->pipe, available, error)) {
+                if (conn->alive.load()) std::printf("[relay] read failed: %s\n", error.c_str());
+                break;
+            }
+            if (available < kaze::kHeaderSize) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(8));
                 continue;
             }
@@ -380,26 +380,33 @@ private:
                 
                 const std::string target_id = envelope.invoke_request().adapter();
                 std::shared_ptr<Connection> target;
+                bool ambiguous = false;
                 {
                     std::lock_guard<std::mutex> lock(adapters_mutex_);
                     if (target_id.empty()) {
-                        if (!adapters_.empty()) target = adapters_.begin()->second;
+                        if (adapters_.size() == 1) target = adapters_.begin()->second;
+                        ambiguous = adapters_.size() > 1;
                     } else {
                         auto it = adapters_.find(target_id);
                         if (it != adapters_.end()) target = it->second;
                     }
                 }
 
+                std::string failure;
                 if (target) {
                     std::printf("[relay] invoke op=%s -> %s\n",
                                 envelope.invoke_request().op().c_str(),
                                 target->adapter_name.c_str());
-                    Send(*target, envelope);
+                    if (!Send(*target, envelope)) failure = "adapter send failed";
                 } else {
+                    failure = ambiguous ? "adapter required when multiple adapters are connected"
+                                        : "adapter not connected";
+                }
+                if (!failure.empty()) {
                     kaze::v1::Envelope reply;
                     reply.set_msg_id(envelope.msg_id());
                     reply.mutable_invoke_result()->set_ok(false);
-                    reply.mutable_invoke_result()->set_detail("adapter not connected");
+                    reply.mutable_invoke_result()->set_detail(failure);
                     Send(conn, reply);
                 }
                 break;
@@ -437,15 +444,14 @@ private:
                     auto it = adapters_.find(adapter_id);
                     if (it != adapters_.end()) target = it->second;
                 }
-                if (target) {
-                    Send(*target, envelope);
-                }
-                std::printf("[relay] push adapter=%s units=%d\n", adapter_id.c_str(),
-                            envelope.text_push().units_size());
+                const bool delivered = target ? Send(*target, envelope)
+                                              : (adapter_id == FakeAdapter::kId && fake_started_.load());
+                std::printf("[relay] push adapter=%s units=%d delivered=%d\n", adapter_id.c_str(),
+                            envelope.text_push().units_size(), delivered ? 1 : 0);
                 kaze::v1::Envelope reply;
                 reply.set_msg_id(envelope.msg_id());
                 reply.mutable_ack()->set_ref_id(envelope.msg_id());
-                reply.mutable_ack()->set_ok(true);
+                reply.mutable_ack()->set_ok(delivered);
                 Send(conn, reply);
                 break;
             }
@@ -473,14 +479,16 @@ private:
 
         std::shared_ptr<Connection> adapter_conn;
         std::string resolved;
+        bool ambiguous = false;
 
         {
             std::lock_guard<std::mutex> lock(adapters_mutex_);
             if (requested.empty() || requested == "auto") {
-                if (!adapters_.empty()) {
+                if (adapters_.size() == 1) {
                     resolved = adapters_.begin()->first;
                     adapter_conn = adapters_.begin()->second;
                 }
+                ambiguous = adapters_.size() > 1;
             } else {
                 auto it = adapters_.find(requested);
                 if (it != adapters_.end()) {
@@ -490,12 +498,29 @@ private:
             }
         }
 
-        
+        if (ambiguous) {
+            kaze::v1::Envelope reply;
+            reply.set_msg_id(envelope.msg_id());
+            auto* result = reply.mutable_attach_result();
+            result->set_ok(false);
+            result->set_detail("adapter required when multiple adapters are connected");
+            Send(conn, reply);
+            return;
+        }
+
         if (!resolved.empty() && adapter_conn) {
             kaze::v1::Envelope forward;
             forward.set_msg_id(NextMessageId());
             *forward.mutable_attach() = envelope.attach();
-            Send(*adapter_conn, forward);
+            if (!Send(*adapter_conn, forward)) {
+                kaze::v1::Envelope reply;
+                reply.set_msg_id(envelope.msg_id());
+                auto* result = reply.mutable_attach_result();
+                result->set_ok(false);
+                result->set_detail("adapter send failed");
+                Send(conn, reply);
+                return;
+            }
 
             std::printf("[relay] attach -> adapter=%s\n", resolved.c_str());
 
@@ -523,6 +548,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(adapter_mutex_);
             adapter_.Start([this](kaze::v1::TextBatch batch) { ForwardBatch(std::move(batch)); });
+            fake_started_.store(true);
         }
 
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -583,13 +609,16 @@ private:
         }
         if (!conn->adapter_name.empty()) {
             std::lock_guard<std::mutex> lock(adapters_mutex_);
-            adapters_.erase(conn->adapter_name);
+            auto it = adapters_.find(conn->adapter_name);
+            if (it != adapters_.end() && it->second == conn) adapters_.erase(it);
         }
-        if (conn->pipe != INVALID_HANDLE_VALUE) {
-            FlushFileBuffers(conn->pipe);
-            DisconnectNamedPipe(conn->pipe);
-            CloseHandle(conn->pipe);
-            conn->pipe = INVALID_HANDLE_VALUE;
+        {
+            std::lock_guard<std::mutex> lock(conn->write_mutex);
+            if (conn->pipe != INVALID_HANDLE_VALUE) {
+                DisconnectNamedPipe(conn->pipe);
+                CloseHandle(conn->pipe);
+                conn->pipe = INVALID_HANDLE_VALUE;
+            }
         }
         std::printf("[relay] client closed\n");
     }
@@ -602,6 +631,7 @@ private:
     std::unordered_map<std::string, std::shared_ptr<Connection>> adapters_;
     std::mutex adapter_mutex_;
     FakeAdapter adapter_;
+    std::atomic<bool> fake_started_{false};
     std::atomic<bool> stop_{false};
 };
 
@@ -657,11 +687,21 @@ struct Client {
     bool Receive(kaze::v1::Envelope& out, std::string& error, int timeout_ms = 5000) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         while (std::chrono::steady_clock::now() < deadline) {
-            if (PeekAvailable(pipe) >= kaze::kHeaderSize) {
+            DWORD available = 0;
+            if (!PeekAvailable(pipe, available, error)) return false;
+            if (available >= kaze::kHeaderSize) {
                 Frame frame;
-                if (!ReadFrame(pipe, frame, error)) return false;
-                return out.ParseFromArray(frame.payload.data(),
-                                          static_cast<int>(frame.payload.size()));
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           deadline - std::chrono::steady_clock::now())
+                                           .count();
+                if (!ReadFrame(pipe, frame, error, remaining > 0 ? static_cast<int>(remaining) : 1)) {
+                    return false;
+                }
+                if (!out.ParseFromArray(frame.payload.data(), static_cast<int>(frame.payload.size()))) {
+                    error = "invalid protobuf envelope";
+                    return false;
+                }
+                return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }

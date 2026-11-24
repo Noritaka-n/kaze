@@ -26,7 +26,7 @@
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/Noritaka-n/kaze/releases) 下载 `Kaze-x.x.x-win-x64.zip`，解压后运行 `Kaze.exe`（自带运行环境，无需安装 Java）。
+1. 从 [Releases](https://github.com/Noritaka-n/kaze/releases) 下载 `Kaze-x.x.x-win-x64.zip`，解压后运行 `Kaze.exe`（标准包自带 Java、relay 与适配器运行环境）。若包内包含 `RUNTIME-REQUIREMENTS.txt`，该构建不内置适配器运行时，需按该文件安装 64 位 Python 3.11+ 并配置 `PATH` 或 `KAZE_PYTHON`。
 2. 在「游戏库」添加游戏所在文件夹。
 3. 在「设置」填入翻译 API（Base URL / 模型 / API Key，任意 OpenAI 兼容接口均可）。
 4. 在「翻译」页扫描 → 翻译 → 写回；或在「修改器」页启动游戏后实时修改。

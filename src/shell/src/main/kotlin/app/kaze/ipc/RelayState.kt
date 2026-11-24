@@ -8,6 +8,7 @@ import app.kaze.proto.TextPush
 import app.kaze.proto.TextUnit
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 sealed interface RelayStatus {
     data object Offline : RelayStatus
@@ -25,10 +26,6 @@ data class RelayUnit(
     val adapter: String = "",
 )
 
-
-
-
-
 object RelayState {
     private val logFile: java.nio.file.Path = run {
         val base = System.getenv("LOCALAPPDATA") ?: System.getProperty("user.home")
@@ -39,28 +36,96 @@ object RelayState {
 
     private fun log(message: String) {
         val line = "${java.time.LocalTime.now()} $message\n"
-        runCatching { java.nio.file.Files.writeString(logFile, line, java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND) }
+        runCatching {
+            java.nio.file.Files.writeString(
+                logFile,
+                line,
+                java.nio.file.StandardOpenOption.CREATE,
+                java.nio.file.StandardOpenOption.APPEND,
+            )
+        }
     }
 
+    @Volatile
     var status: RelayStatus = RelayStatus.Offline
         private set
 
+    @Volatile
     var units: List<RelayUnit> = emptyList()
         private set
 
+    @Volatile
     var note: String? = null
         private set
 
+    private data class PendingInvoke(
+        val generation: Long,
+        val callback: (InvokeResult) -> Unit,
+    )
+
+    private val connectionLock = Any()
+    private val generationCounter = AtomicLong(0)
+
+    @Volatile
     private var client: RelayClient? = null
+
+    @Volatile
+    private var clientGeneration = 0L
+
     private val connecting = AtomicBoolean(false)
-    private val pendingInvokes = ConcurrentHashMap<Long, (InvokeResult) -> Unit>()
+    private val pendingInvokes = ConcurrentHashMap<Long, PendingInvoke>()
 
     private val watchdogStarted = AtomicBoolean(false)
     private val attachRetrying = AtomicBoolean(false)
 
-    
+    private fun failedResult(detail: String): InvokeResult =
+        InvokeResult.newBuilder().setOk(false).setDetail(detail).build()
 
+    private fun deliver(pending: PendingInvoke, result: InvokeResult) {
+        runCatching { pending.callback(result) }.onFailure {
+            log("invoke callback failed: ${it.javaClass.simpleName}: ${it.message}")
+        }
+    }
 
+    private fun complete(msgId: Long, pending: PendingInvoke, result: InvokeResult) {
+        if (pendingInvokes.remove(msgId, pending)) deliver(pending, result)
+    }
+
+    private fun failPending(generation: Long? = null, detail: String) {
+        val failed = mutableListOf<PendingInvoke>()
+        pendingInvokes.forEach { (msgId, pending) ->
+            if ((generation == null || pending.generation == generation) &&
+                pendingInvokes.remove(msgId, pending)
+            ) {
+                failed += pending
+            }
+        }
+        failed.forEach { deliver(it, failedResult(detail)) }
+    }
+
+    private fun isCurrent(connection: RelayClient, generation: Long): Boolean =
+        generationCounter.get() == generation && client === connection && clientGeneration == generation
+
+    private fun disconnect(
+        connection: RelayClient,
+        generation: Long,
+        detail: String,
+        resultingStatus: RelayStatus = RelayStatus.Offline,
+    ): Boolean {
+        val owned = synchronized(connectionLock) {
+            if (!isCurrent(connection, generation)) {
+                false
+            } else {
+                client = null
+                status = resultingStatus
+                true
+            }
+        }
+        if (!owned) return false
+        runCatching { connection.close() }
+        failPending(generation, detail)
+        return true
+    }
 
     private fun scheduleAttachRetry() {
         if (!attachRetrying.compareAndSet(false, true)) return
@@ -82,17 +147,13 @@ object RelayState {
         }
     }
 
-    
-
-
-
     fun ensureWatchdog() {
         if (!watchdogStarted.compareAndSet(false, true)) return
         Thread({
             var lastAttempt = 0L
             while (true) {
                 Thread.sleep(2000)
-                if (status is RelayStatus.Online) continue
+                if (status is RelayStatus.Online || status is RelayStatus.Connecting) continue
                 val now = System.currentTimeMillis()
                 if (now - lastAttempt < 3000) continue
                 lastAttempt = now
@@ -108,32 +169,68 @@ object RelayState {
     fun connectAsync() {
         ensureWatchdog()
         if (!connecting.compareAndSet(false, true)) return
-        runCatching { client?.close() }
-        client = null
-        status = RelayStatus.Connecting
+
+        val generation: Long
+        val previous: RelayClient?
+        synchronized(connectionLock) {
+            generation = generationCounter.incrementAndGet()
+            previous = client
+            client = null
+            clientGeneration = generation
+            status = RelayStatus.Connecting
+        }
+        runCatching { previous?.close() }
+        failPending(detail = "relay 正在重连")
 
         Thread({
+            var connection: RelayClient? = null
+            var published = false
             try {
                 log("connect: reading session file")
                 val session = RelaySessionFile.read()
                     ?: throw IllegalStateException("未找到 relay.json")
                 log("connect: pipe=${session.pipe} pid=${session.pid}")
                 val transport = NamedPipeTransport("\\\\.\\pipe\\${session.pipe}")
-                val connection = RelayClient(transport)
-                val welcome = connection.handshake(session.token, "shell-${System.nanoTime()}")
-                client = connection
+                val newConnection = RelayClient(transport)
+                connection = newConnection
+                val welcome = newConnection.handshake(session.token, "shell-${System.nanoTime()}")
+
+                val accepted = synchronized(connectionLock) {
+                    if (generationCounter.get() != generation) {
+                        false
+                    } else {
+                        client = newConnection
+                        clientGeneration = generation
+                        published = true
+                        status = RelayStatus.Online(welcome.session, welcome.relayVersion)
+                        true
+                    }
+                }
+                if (!accepted) {
+                    runCatching { newConnection.close() }
+                    return@Thread
+                }
+
                 log("connect: welcome session=${welcome.session} version=${welcome.relayVersion}")
-                publish { status = RelayStatus.Online(welcome.session, welcome.relayVersion) }
                 log("connect: attaching default adapter")
                 attach("")
-                Thread({ readLoop(connection) }, "kaze-relay-reader").apply {
+                Thread({ readLoop(newConnection, generation) }, "kaze-relay-reader").apply {
                     isDaemon = true
                     start()
                 }
             } catch (t: Throwable) {
                 log("connect failed: ${t.javaClass.simpleName}: ${t.message}")
-                publish { status = RelayStatus.Failed(t.message ?: t.javaClass.simpleName) }
+                val currentConnection = connection
+                if (published && currentConnection != null) {
+                    disconnect(currentConnection, generation, "relay 连接失败：${t.message}")
+                }
+                synchronized(connectionLock) {
+                    if (generationCounter.get() == generation) {
+                        status = RelayStatus.Failed(t.message ?: t.javaClass.simpleName)
+                    }
+                }
             } finally {
+                if (!published) runCatching { connection?.close() }
                 connecting.set(false)
             }
         }, "kaze-relay-connect").apply {
@@ -144,12 +241,14 @@ object RelayState {
 
     fun attach(adapter: String = "") {
         val connection = client
-        if (connection == null) {
+        val generation = clientGeneration
+        if (connection == null || !isCurrent(connection, generation)) {
             note = "relay 未连接"
             return
         }
         Thread({
             try {
+                if (!isCurrent(connection, generation)) return@Thread
                 log("attach sending adapter=$adapter")
                 connection.send(
                     Envelope.newBuilder()
@@ -164,7 +263,10 @@ object RelayState {
                 log("attach sent adapter=$adapter")
             } catch (t: Throwable) {
                 log("attach failed: ${t.javaClass.simpleName}: ${t.message}")
-                publish { note = "attach 失败：${t.message}" }
+                if (isCurrent(connection, generation)) {
+                    publish { note = "attach 失败：${t.message}" }
+                }
+                disconnect(connection, generation, "attach 发送失败：${t.message}")
             }
         }, "kaze-relay-attach").apply {
             isDaemon = true
@@ -172,7 +274,6 @@ object RelayState {
         }
     }
 
-    
     fun invoke(
         op: String,
         argsJson: String = "{}",
@@ -180,27 +281,29 @@ object RelayState {
         onResult: (InvokeResult) -> Unit = {},
     ) {
         val connection = client
-        if (connection == null) {
-            onResult(InvokeResult.newBuilder().setOk(false).setDetail("relay 未连接").build())
+        val generation = clientGeneration
+        if (connection == null || !isCurrent(connection, generation)) {
+            onResult(failedResult("relay 未连接"))
             return
         }
 
         val msgId = connection.nextId()
-        pendingInvokes[msgId] = onResult
+        val pending = PendingInvoke(generation, onResult)
+        pendingInvokes[msgId] = pending
 
-        
         Thread({
             Thread.sleep(8000)
-            val pending = pendingInvokes.remove(msgId)
-            pending?.invoke(
-                InvokeResult.newBuilder().setOk(false).setDetail("超时：适配器未响应").build()
-            )
+            complete(msgId, pending, failedResult("超时：适配器未响应"))
         }, "kaze-relay-invoke-watchdog").apply {
             isDaemon = true
             start()
         }
 
         Thread({
+            if (!isCurrent(connection, generation)) {
+                complete(msgId, pending, failedResult("relay 已重连"))
+                return@Thread
+            }
             try {
                 connection.send(
                     Envelope.newBuilder()
@@ -214,8 +317,11 @@ object RelayState {
                         .build()
                 )
             } catch (t: Throwable) {
-                pendingInvokes.remove(msgId)
-                publish { note = "invoke 失败：${t.message}" }
+                complete(msgId, pending, failedResult("invoke 发送失败：${t.message}"))
+                if (isCurrent(connection, generation)) {
+                    publish { note = "invoke 失败：${t.message}" }
+                }
+                disconnect(connection, generation, "invoke 发送失败：${t.message}")
             }
         }, "kaze-relay-invoke").apply {
             isDaemon = true
@@ -225,13 +331,15 @@ object RelayState {
 
     fun push(unit: RelayUnit, target: String) = pushAll(listOf(unit to target))
 
-    
     fun pushAll(translations: List<Pair<RelayUnit, String>>) {
         if (translations.isEmpty()) return
         val connection = client ?: return
+        val generation = clientGeneration
+        if (!isCurrent(connection, generation)) return
 
         Thread({
             try {
+                if (!isCurrent(connection, generation)) return@Thread
                 val adapter = translations.first().first.adapter.ifBlank { "fake" }
                 val builder = TextPush.newBuilder().setAdapter(adapter)
                 translations.forEach { (unit, target) ->
@@ -243,8 +351,8 @@ object RelayState {
                     .setTextPush(builder)
                     .build()
                 connection.send(env)
-            } catch (_: Throwable) {
-                
+            } catch (t: Throwable) {
+                disconnect(connection, generation, "text push 发送失败：${t.message}")
             }
         }, "kaze-relay-push").apply {
             isDaemon = true
@@ -252,14 +360,15 @@ object RelayState {
         }
     }
 
-    private fun readLoop(connection: RelayClient) {
+    private fun readLoop(connection: RelayClient, generation: Long) {
         try {
-            while (true) {
+            while (isCurrent(connection, generation)) {
                 if (connection.available() < KzCodec.HEADER) {
                     Thread.sleep(8)
                     continue
                 }
-                val envelope = connection.receive() ?: break
+                val envelope = connection.receive(RelayClient.FRAME_READ_TIMEOUT_MS) ?: break
+                if (!isCurrent(connection, generation)) break
                 log("recv ${envelope.bodyCase}")
                 when (envelope.bodyCase) {
                     Envelope.BodyCase.TEXT_BATCH -> {
@@ -268,7 +377,6 @@ object RelayState {
                             RelayUnit(it.key, it.source, it.speaker, it.scene, it.target, adapter)
                         }
                         publish {
-                            
                             val known = units.associateBy { it.key }
                             val merged = incoming.map { unit ->
                                 val hit = known[unit.key]
@@ -296,18 +404,22 @@ object RelayState {
                         val error = envelope.error
                         publish { note = "relay 错误 ${error.code}：${error.message}" }
                         if (error.code == 409) {
-                            
-                            
-                            publish { status = RelayStatus.Failed(error.message) }
-                            runCatching { client?.close() }
-                            client = null
+                            disconnect(
+                                connection,
+                                generation,
+                                "relay 拒绝连接：${error.message}",
+                                RelayStatus.Failed(error.message),
+                            )
                         } else {
                             scheduleAttachRetry()
                         }
                     }
 
                     Envelope.BodyCase.INVOKE_RESULT -> {
-                        pendingInvokes.remove(envelope.msgId)?.invoke(envelope.invokeResult)
+                        val pending = pendingInvokes[envelope.msgId]
+                        if (pending != null && pending.generation == generation) {
+                            complete(envelope.msgId, pending, envelope.invokeResult)
+                        }
                     }
 
                     else -> Unit
@@ -316,8 +428,8 @@ object RelayState {
         } catch (t: Throwable) {
             log("read loop ended: ${t.javaClass.simpleName}: ${t.message}")
         } finally {
-            log("read loop exited")
-            publish { status = RelayStatus.Offline }
+            log("read loop exited generation=$generation")
+            disconnect(connection, generation, "relay 连接已断开")
         }
     }
 
@@ -325,4 +437,3 @@ object RelayState {
         block()
     }
 }
-

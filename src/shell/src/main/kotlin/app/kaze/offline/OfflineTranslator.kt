@@ -18,23 +18,30 @@ import kotlinx.coroutines.withTimeout
 
 
 object OfflineTranslator {
+    private val stateLock = Any()
+
+    @Volatile
     var busy: Boolean = false
         private set
 
+    @Volatile
     var done: Int = 0
         private set
 
+    @Volatile
     var total: Int = 0
         private set
 
+    @Volatile
     var message: String = ""
         private set
 
+    @Volatile
     var lastError: String? = null
         private set
 
-    fun reset() {
-        busy = false
+    fun reset() = synchronized(stateLock) {
+        if (busy) return@synchronized
         done = 0
         total = 0
         message = ""
@@ -73,21 +80,21 @@ object OfflineTranslator {
             }
         }
 
-        total = unique.size
-        done = 0
-        message = "准备中…"
-        lastError = null
-        if (unique.isEmpty()) {
-            message = "没有可翻文本"
-            return emptyMap()
+        synchronized(stateLock) {
+            if (busy) return emptyMap()
+            if (unique.isEmpty()) {
+                total = 0
+                done = 0
+                message = "没有可翻文本"
+                lastError = null
+                return emptyMap()
+            }
+            total = unique.size
+            done = 0
+            message = "准备中…"
+            lastError = null
+            busy = true
         }
-        if (busy) {
-            lastError = "翻译已在进行中"
-            message = "翻译已在进行中"
-            return emptyMap()
-        }
-
-        busy = true
         val output = LinkedHashMap<String, String>()
         try {
             
@@ -162,7 +169,7 @@ object OfflineTranslator {
                             
                             val sentScenes = HashSet<String>()
                             val rawByKey = HashMap<String, String>()
-                            val tokensByKey = HashMap<String, List<String>>()
+                            val protectedByKey = HashMap<String, ControlCodes.Protected>()
                             val units = part.map { entry ->
                                 val key = sceneKey(entry.locator)
                                 val scene = if (sentScenes.add(key)) {
@@ -173,7 +180,7 @@ object OfflineTranslator {
                                 val textKey = TextKey.of(entry.text)
                                 val protected = ControlCodes.protect(entry.text)
                                 rawByKey[textKey] = entry.text
-                                tokensByKey[textKey] = protected.tokens
+                                protectedByKey[textKey] = protected
                                 RelayUnit(
                                     key = textKey,
                                     source = protected.text,
@@ -212,7 +219,12 @@ object OfflineTranslator {
                                 if (target.isBlank()) return@forEach
                                 val raw = rawByKey[key] ?: units.firstOrNull { it.key == key }?.source
                                     ?: return@forEach
-                                val restored = ControlCodes.restore(target, tokensByKey[key].orEmpty())
+                                val protected = protectedByKey[key] ?: return@forEach
+                                val restored = ControlCodes.restore(
+                                    target,
+                                    protected.tokens,
+                                    protected.startIndex,
+                                )
                                 if (restored == null) {
                                     
                                     
@@ -242,7 +254,7 @@ object OfflineTranslator {
             }
             return output
         } finally {
-            busy = false
+            synchronized(stateLock) { busy = false }
         }
     }
 }
