@@ -33,7 +33,7 @@ using kaze::PeekAvailable;
 using kaze::ReadFrame;
 using kaze::WriteFrame;
 
-constexpr const char* kVersion = "1.0.1";
+constexpr const char* kVersion = "1.0.2";
 
 
 
