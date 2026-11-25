@@ -94,15 +94,26 @@ if ($hasPyInstaller) {
         @{ Name = "kaze-memory-adapter"; Script = "adapters\memory\memory_adapter.py" }
     )
     foreach ($spec in $adapterSpecs) {
-        & $python -m PyInstaller --noconfirm --clean --onefile `
-            --name $spec.Name --distpath $adapterRuntime `
-            --workpath (Join-Path $adapterBuild "work\$($spec.Name)") `
-            --specpath (Join-Path $adapterBuild "spec") `
-            --paths (Join-Path $root "adapters\renpy") `
-            --paths (Join-Path $root "adapters\mvmz") `
-            --hidden-import kz_wire --hidden-import kaze_client `
-            (Join-Path $root $spec.Script)
-        if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed for $($spec.Name): $LASTEXITCODE" }
+        # PyInstaller logs progress on stderr. Under $ErrorActionPreference=Stop
+        # PowerShell 5 turns native stderr into a terminating error, so relax it
+        # here and judge success solely by the exit code.
+        $adapterLog = Join-Path $adapterBuild "pyinstaller-$($spec.Name).log"
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & $python -m PyInstaller --noconfirm --clean --onefile `
+                --name $spec.Name --distpath $adapterRuntime `
+                --workpath (Join-Path $adapterBuild "work\$($spec.Name)") `
+                --specpath (Join-Path $adapterBuild "spec") `
+                --paths (Join-Path $root "adapters\renpy") `
+                --paths (Join-Path $root "adapters\mvmz") `
+                --hidden-import kz_wire --hidden-import kaze_client `
+                (Join-Path $root $spec.Script) 2>&1 | Tee-Object -FilePath $adapterLog | Out-Null
+            $pyInstallerExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
+        if ($pyInstallerExit -ne 0) { throw "PyInstaller failed for $($spec.Name): $pyInstallerExit (see $adapterLog)" }
         $builtAdapter = Join-Path $adapterRuntime "$($spec.Name).exe"
         if (-not (Test-Path $builtAdapter)) { throw "Standalone adapter was not created: $builtAdapter" }
         & $builtAdapter --help | Out-Host
@@ -123,8 +134,17 @@ New-Item -ItemType Directory -Force (Join-Path $shell "build\wix311") | Out-Null
 $gradleArgs = @("-p", $shell, "--no-daemon", "--warning-mode", "all")
 if (-not $SkipTests) { $gradleArgs += "test" }
 $gradleArgs += @("createDistributable", "-x", "downloadWix", "-x", "unzipWix")
-& $gradle @gradleArgs
-if ($LASTEXITCODE -ne 0) { throw "Gradle build failed: $LASTEXITCODE" }
+# Same native-stderr caveat as PyInstaller: judge Gradle by its exit code.
+$gradleLog = Join-Path $shell "build\gradle-package.log"
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    & $gradle @gradleArgs 2>&1 | Tee-Object -FilePath $gradleLog | Out-Host
+    $gradleExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousPreference
+}
+if ($gradleExit -ne 0) { throw "Gradle build failed: $gradleExit (see $gradleLog)" }
 
 $distribution = Join-Path $shell "build\compose\binaries\main\app\Kaze"
 if (-not (Test-Path (Join-Path $distribution "Kaze.exe"))) {
@@ -234,3 +254,8 @@ Write-Host "[package] ok"
 Write-Host "  archive: $archive"
 Write-Host "  sha256:  $hash"
 Write-Host "  hash file: $hashFile"
+
+# Native tools such as Gradle and PyInstaller write progress to stderr. A caller
+# that treats native stderr as a terminating error would otherwise see a failure
+# even though the archive was produced. Report success explicitly.
+exit 0
