@@ -1,6 +1,0 @@
-# Optional: regenerate the checked-in RGSS test fixtures.
-rubymarshal==1.2.10
-
-# Required by package_release.ps1 for standalone runtime-bin adapters.
-pyinstaller==6.14.2
-pyinstaller-hooks-contrib==2026.10
