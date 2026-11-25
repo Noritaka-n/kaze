@@ -292,3 +292,31 @@ def parse_invoke_result(payload: bytes) -> dict:
         "detail": get_str(fields, 2),
         "data_json": get_str(fields, 3),
     }
+
+
+def safe_extract(archive, target: str) -> int:
+    """Extract a backup archive, refusing entries that escape ``target``.
+
+    ``ZipFile.extractall`` happily writes ``../`` members outside the target
+    directory, so a malformed or hand-edited backup could overwrite files
+    anywhere the user can write. Only regular files under ``target`` are kept.
+    """
+    import os
+
+    root = os.path.realpath(target)
+    prefix = root + os.sep
+    count = 0
+    for member in archive.infolist():
+        name = member.filename.replace("\\", "/")
+        if not name or name.endswith("/"):
+            continue
+        destination = os.path.realpath(os.path.join(root, name))
+        if destination != root and not destination.startswith(prefix):
+            raise ValueError(f"存档包含越界路径: {member.filename}")
+        parent = os.path.dirname(destination)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with archive.open(member) as source, open(destination, "wb") as handle:
+            handle.write(source.read())
+        count += 1
+    return count

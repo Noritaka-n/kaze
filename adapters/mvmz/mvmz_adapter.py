@@ -32,6 +32,9 @@ from kaze_client import KazeClient
 from cdp import CDP              
 
 ROLE_ADAPTER = 2
+
+# RPG Maker variable/switch ids stay far below this; anything larger is garbage.
+MAX_SAVE_SLOT = 20_000
 ADAPTER_NAME = "mvmz"
 
 
@@ -1686,10 +1689,17 @@ class MvmzAdapter:
         if gold is not None:
             data.setdefault("party", {})["_gold"] = int(gold)
 
+        skipped_slots = 0
         for key, value in (args.get("variables") or {}).items():
             try:
                 index = int(key)
-            except ValueError:
+            except (TypeError, ValueError):
+                skipped_slots += 1
+                continue
+            if index < 0 or index > MAX_SAVE_SLOT:
+                # A negative index would silently rewrite the last entry, and a
+                # huge one would allocate millions of slots.
+                skipped_slots += 1
                 continue
             array = data.setdefault("variables", {}).setdefault("_data", [])
             while len(array) <= index:
@@ -1699,7 +1709,11 @@ class MvmzAdapter:
         for key, value in (args.get("switches") or {}).items():
             try:
                 index = int(key)
-            except ValueError:
+            except (TypeError, ValueError):
+                skipped_slots += 1
+                continue
+            if index < 0 or index > MAX_SAVE_SLOT:
+                skipped_slots += 1
                 continue
             array = data.setdefault("switches", {}).setdefault("_data", [])
             while len(array) <= index:
@@ -1710,8 +1724,12 @@ class MvmzAdapter:
             self._encode_save(path, data)
         except Exception as exc:
             return {"ok": False, "detail": f"写入失败: {exc}"}
-        return {"ok": True, "detail": f"已写入 {name}（原文件备份 .kaze-backup）",
-                "data_json": json.dumps({"file": name, "gold": data.get("party", {}).get("_gold", 0)})}
+        detail = f"已写入 {name}（原文件备份 .kaze-backup）"
+        if skipped_slots:
+            detail += f"；跳过 {skipped_slots} 个越界序号"
+        return {"ok": True, "detail": detail,
+                "data_json": json.dumps({"file": name, "gold": data.get("party", {}).get("_gold", 0),
+                                         "skipped": skipped_slots})}
     def _saves_backups(self) -> dict:
         folder = self._backup_dir()
         items = []
@@ -1748,7 +1766,7 @@ class MvmzAdapter:
                 shutil.rmtree(safety)
             shutil.copytree(target, safety)
             with zipfile.ZipFile(archive_path) as archive:
-                archive.extractall(target)
+                kz_wire.safe_extract(archive, target)
         except Exception as exc:
             return {"ok": False, "detail": f"还原失败: {exc}"}
         return {"ok": True, "detail": f"已还原 {name}（原存档留 {os.path.basename(safety)}）"}
@@ -1772,11 +1790,14 @@ class MvmzAdapter:
         latest = max(archives, key=os.path.getmtime)
 
         safety = target + "-before-restore"
-        if os.path.isdir(safety):
-            shutil.rmtree(safety)
-        shutil.copytree(target, safety)
-        with zipfile.ZipFile(latest) as archive:
-            archive.extractall(target)
+        try:
+            if os.path.isdir(safety):
+                shutil.rmtree(safety)
+            shutil.copytree(target, safety)
+            with zipfile.ZipFile(latest) as archive:
+                kz_wire.safe_extract(archive, target)
+        except Exception as exc:
+            return {"ok": False, "detail": f"还原失败: {exc}"}
         return {"ok": True, "detail": f"已还原 {os.path.basename(latest)}"}
 
                                                                          

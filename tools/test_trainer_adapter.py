@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(ROOT, "adapters", "memory"))
 
 import mvmz_adapter
 import memory_adapter
+import kz_wire
 import renpy_adapter
 
 FAILED: list[str] = []
@@ -310,6 +311,144 @@ def test_save_formats_and_memory_boundaries() -> None:
         memory_adapter.CHUNK = previous_chunk
 
 
+def test_backup_restore_safety() -> None:
+    import zipfile
+
+    with tempfile.TemporaryDirectory(prefix="kaze-zip-test-") as temporary:
+        target = os.path.join(temporary, "saves")
+        os.makedirs(target)
+        inside = os.path.join(target, "1-1-LT1.save")
+        with open(inside, "wb") as handle:
+            handle.write(b"ok")
+
+        good = os.path.join(temporary, "renpy-good.zip")
+        with zipfile.ZipFile(good, "w") as archive:
+            archive.writestr("1-1-LT1.save", b"restored")
+            archive.writestr("sub/nested.save", b"nested")
+        with zipfile.ZipFile(good) as archive:
+            count = kz_wire.safe_extract(archive, target)
+        with open(inside, "rb") as handle:
+            restored = handle.read()
+        check(
+            "safe extract restores entries inside the target",
+            count == 2 and restored == b"restored" and os.path.isfile(os.path.join(target, "sub", "nested.save")),
+            f"count={count} restored={restored!r}",
+        )
+
+        outside = os.path.join(temporary, "escaped.save")
+        evil = os.path.join(temporary, "evil.zip")
+        with zipfile.ZipFile(evil, "w") as archive:
+            archive.writestr("../escaped.save", b"pwned")
+        try:
+            with zipfile.ZipFile(evil) as archive:
+                kz_wire.safe_extract(archive, target)
+            rejected = False
+        except ValueError:
+            rejected = True
+        check(
+            "safe extract refuses entries that escape the target",
+            rejected and not os.path.exists(outside),
+            f"rejected={rejected} escaped_exists={os.path.exists(outside)}",
+        )
+
+        absolute = os.path.join(temporary, "absolute.zip")
+        with zipfile.ZipFile(absolute, "w") as archive:
+            archive.writestr(os.path.join(temporary, "abs.save").replace("\\", "/"), b"pwned")
+        try:
+            with zipfile.ZipFile(absolute) as archive:
+                kz_wire.safe_extract(archive, target)
+            absolute_rejected = False
+        except ValueError:
+            absolute_rejected = True
+        check("safe extract refuses absolute entry paths", absolute_rejected)
+
+    previous = os.environ.get("APPDATA")
+    with tempfile.TemporaryDirectory(prefix="kaze-backup-filter-") as temporary:
+        appdata = os.path.join(temporary, "appdata")
+        backups = os.path.join(appdata, "Kaze", "backups")
+        os.makedirs(backups)
+        for name in ("mvmz-20260101-000000.zip", "renpy-20260101-000000.zip"):
+            with open(os.path.join(backups, name), "wb") as handle:
+                handle.write(b"PK")
+        os.environ["APPDATA"] = appdata
+        try:
+            adapter = renpy_adapter.Adapter(None, demo=True)
+            filtered = [
+                name for name in os.listdir(backups)
+                if name.startswith("renpy-") and name.endswith(".zip")
+            ]
+            check(
+                "renpy restore only considers its own backups",
+                filtered == ["renpy-20260101-000000.zip"],
+                str(filtered),
+            )
+            del adapter
+        finally:
+            if previous is None:
+                os.environ.pop("APPDATA", None)
+            else:
+                os.environ["APPDATA"] = previous
+
+
+def test_save_patch_rejects_invalid_slots() -> None:
+    with tempfile.TemporaryDirectory(prefix="kaze-patch-test-") as temporary:
+        path = os.path.join(temporary, "file1.rpgsave")
+        data = {"party": {"_gold": 5}, "variables": {"_data": [0, 11, 22, 33]},
+                "switches": {"_data": [False]}}
+        with open(path, "wb") as handle:
+            handle.write(mvmz_adapter.lzstring.compress_to_base64(jsonlib.dumps(data)).encode("ascii"))
+
+        adapter = object.__new__(mvmz_adapter.MvmzAdapter)
+        adapter._save_path = lambda name: path
+        result = adapter._saves_patch({
+            "file": "file1.rpgsave",
+            "variables": {"-1": 999, "4": 44, "99999999": 1},
+            "switches": {"-2": True},
+        })
+        after = adapter._decode_save(path)
+        variables = after["variables"]["_data"]
+        check(
+            "save patch keeps original slots when ids are out of range",
+            variables[3] == 33 and variables[4] == 44 and 999 not in variables,
+            str(variables),
+        )
+        check("save patch does not allocate oversized slot arrays", len(variables) < 100, str(len(variables)))
+        check(
+            "save patch reports skipped out-of-range ids",
+            result["ok"] and '"skipped": 3' in result["data_json"],
+            result["data_json"],
+        )
+
+
+def test_adapter_invoke_never_raises() -> None:
+    adapter = object.__new__(memory_adapter.MemoryAdapter)
+    adapter.handle = 1
+    adapter.candidates = []
+    adapter.last_type = "int"
+    adapter.last_value = 0
+    adapter.pid = 1
+    adapter.exe = "fake"
+    requests = [
+        {"op": "mem.write", "args_json": '{"address":"abc","value":1,"type":"int"}'},
+        {"op": "mem.write", "args_json": '{"address":4096,"value":99999999999,"type":"int"}'},
+        {"op": "mem.write", "args_json": '{"address":4096,"type":"int"}'},
+        {"op": "mem.scan", "args_json": '{"value":"x","type":"int"}'},
+    ]
+    escaped = []
+    for request in requests:
+        try:
+            result = adapter.handle_invoke(request)
+            if result.get("ok") is not False:
+                escaped.append(f"{request['args_json']} -> {result}")
+        except Exception as exc:
+            escaped.append(f"{request['args_json']} raised {type(exc).__name__}")
+    check(
+        "memory adapter reports malformed invokes instead of crashing",
+        not escaped,
+        "; ".join(escaped),
+    )
+
+
 def test_renpy_values() -> None:
     adapter = renpy_adapter.Adapter(None, demo=True)
     adapter._vars_set({"name": "flag", "value": "true"})
@@ -334,6 +473,9 @@ def main() -> int:
     test_var_labels()
     test_var_pagination()
     test_save_formats_and_memory_boundaries()
+    test_backup_restore_safety()
+    test_save_patch_rejects_invalid_slots()
+    test_adapter_invoke_never_raises()
     test_teleport_bounds()
     test_renpy_values()
     print()

@@ -195,6 +195,13 @@ class Adapter:
                                                                          
 
     def handle_invoke(self, request: dict) -> dict:
+        """Never let a bad argument escape: the caller's loop must survive it."""
+        try:
+            return self._dispatch(request)
+        except Exception as exc:
+            return {"ok": False, "detail": f"{request.get('op') or 'invoke'} 失败: {exc}"}
+
+    def _dispatch(self, request: dict) -> dict:
         op = request.get("op", "")
         try:
             args = json.loads(request.get("args_json") or "{}")
@@ -313,7 +320,7 @@ class Adapter:
         archives = [
             os.path.join(backup_dir, name)
             for name in os.listdir(backup_dir)
-            if name.endswith(".zip")
+            if name.startswith("renpy-") and name.endswith(".zip")
         ]
         if not archives:
             return {"ok": False, "detail": "没有备份文件"}
@@ -331,7 +338,7 @@ class Adapter:
                 shutil.rmtree(safety)
             shutil.copytree(target, safety)
             with zipfile.ZipFile(latest) as archive:
-                archive.extractall(target)
+                kz_wire.safe_extract(archive, target)
         except Exception as exc:
             return {"ok": False, "detail": f"还原失败: {exc}"}
 

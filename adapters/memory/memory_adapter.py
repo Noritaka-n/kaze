@@ -376,6 +376,13 @@ class MemoryAdapter:
                                                                          
 
     def handle_invoke(self, request: dict) -> dict:
+        """Never let a bad argument escape: the caller's loop must survive it."""
+        try:
+            return self._dispatch(request)
+        except Exception as exc:
+            return {"ok": False, "detail": f"{request.get('op') or 'invoke'} 失败: {exc}"}
+
+    def _dispatch(self, request: dict) -> dict:
         op = request.get("op", "")
         try:
             args = json.loads(request.get("args_json") or "{}")
